@@ -1,6 +1,4 @@
-# ttH Neutrino Closure
-
-Truth-level closure tests for the ttH(bb) neutrino/lost-jet reconstruction algebra, in both the semileptonic (SL) and dileptonic (DL) channels. The question this repo answers: given the TRUE four-momenta of every visible particle in a simulated event (no detector effects, no jet mis-assignment from real data), does the analytic Sonnenschein-style quartic solver recover the true neutrino (and, in the SL channel, the true "lost" quark) momentum when it's handed the correct jet pairing?
+# Mass Recostruction Method in the Single-Lepton channel of ttHbb
 
 The pipeline has two stages: **generation** (Pythia8 truth-level event samples) and **solving** (the actual reconstruction algebra, run over those truth events, plus the diagnostics that check it).
 
