@@ -1,0 +1,21 @@
+# ROOT data files -- regenerate via generation/ + solving/ scripts
+*.root
+
+# ROOT ACLiC compiled/generated build artifacts
+*.so
+*.d
+*.pcm
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# EOS/AFS filesystem version-tracking artifacts (not real files)
+.sys.v#.*
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Generated plots -- regenerate via the plot_*.py scripts
+*.png
+plots_*/
