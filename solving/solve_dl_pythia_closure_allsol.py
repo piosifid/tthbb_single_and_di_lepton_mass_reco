@@ -22,16 +22,19 @@ import numpy as np
 import uproot
 from itertools import permutations
 
-MASS_RECO_DL_DIR = "/eos/user/p/piosifid/Main_An_MassReco/mass_reco_jec"
+MASS_RECO_DL_DIR = "."
 sys.path.insert(0, MASS_RECO_DL_DIR)
 
-from mass_reco_functions_mc import (       # noqa: E402
+from mass_reco_functions_dl import (       # noqa: E402
     compute_coefficients,
     quartic_solver,
+    count_quartic_real_roots,
     filter_close_solutions,
     algebraic_pz,
     _pdf_set,
 )
+
+HYP_N_ROOTS = []  # real root count at every (jet-pairing, mt, mW) hypothesis point that had >=1 root
 
 ECM = 13600.0
 Q_SCALE = 234.0
@@ -159,6 +162,7 @@ def solve_event_all(lp, lm, MET_x, MET_y, pool, pool_labels):
                 pnux_roots = filter_close_solutions(quartic_solver(polx_n), tol=1e-2)
                 if not pnux_roots:
                     continue
+                HYP_N_ROOTS.append(count_quartic_real_roots(polx_n))
 
                 for pnux in pnux_roots:
                     c1 = c10 * pnux + c11
@@ -261,6 +265,8 @@ def main():
 
     n_with_solution = 0
     total_rows = 0
+    examples_shown = 0
+    EXAMPLE_MAX = 5
     for i in range(n_do):
         lp = _p4(arrs, "toplep", i)
         lm = _p4(arrs, "atoplep", i)
@@ -285,6 +291,28 @@ def main():
             higgsb1_true["py"] + higgsb2_true["py"],
             higgsb1_true["pz"] + higgsb2_true["pz"],
         )
+
+        correct_rows = [s for s in solutions if s["correct_pairing"]]
+        if correct_rows and examples_shown < EXAMPLE_MAX:
+            examples_shown += 1
+            hm_recos = sorted(set(round(s["higgs_mass_reco"], 6) for s in correct_rows))
+            print(f"\n--- Example event {ev_num}: correct-pairing closure check "
+                  f"({len(correct_rows)} correct-pairing rows across the mt/mW grid) ---")
+            print(f"  higgs_mass_true = {higgs_mass_true:.4f} GeV")
+            print(f"  higgs_mass_reco (correct pairing -- identical for all of them, "
+                  f"since it only depends on which jets were picked, not mt/mW/root): {hm_recos}")
+            best = min(correct_rows, key=lambda s: (s["pnux"] - nu1_true["px"]) ** 2
+                       + (s["pnuy"] - nu1_true["py"]) ** 2 + (s["pnuz"] - nu1_true["pz"]) ** 2
+                       + (s["pnubx"] - nu2_true["px"]) ** 2 + (s["pnuby"] - nu2_true["py"]) ** 2
+                       + (s["pnubz"] - nu2_true["pz"]) ** 2)
+            print(f"  closest-matching correct-pairing neutrino solution "
+                  f"(mt={best['mt']:.0f}, mW={best['mW']:.0f}):")
+            print(f"    nu1_px: true={nu1_true['px']:+8.3f}  reco={best['pnux']:+8.3f}")
+            print(f"    nu1_py: true={nu1_true['py']:+8.3f}  reco={best['pnuy']:+8.3f}")
+            print(f"    nu1_pz: true={nu1_true['pz']:+8.3f}  reco={best['pnuz']:+8.3f}")
+            print(f"    nu2_px: true={nu2_true['px']:+8.3f}  reco={best['pnubx']:+8.3f}")
+            print(f"    nu2_py: true={nu2_true['py']:+8.3f}  reco={best['pnuby']:+8.3f}")
+            print(f"    nu2_pz: true={nu2_true['pz']:+8.3f}  reco={best['pnubz']:+8.3f}")
 
         if solutions:
             n_with_solution += 1
@@ -320,9 +348,18 @@ def main():
     print(f"\nDone: {n_with_solution}/{n_do} events had at least one valid solution.")
     print(f"Total candidate rows written: {total_rows}")
     print("BRANCH_COUNTS:", BRANCH_COUNTS)
+
+    hyp_n_roots = np.asarray(HYP_N_ROOTS, dtype=np.int32)
+    vals, counts = np.unique(hyp_n_roots, return_counts=True)
+    print(f"\n=== real pnux roots per (jet-pairing, mt, mW) hypothesis point ===")
+    for v, c in zip(vals, counts):
+        print(f"  {int(v)} roots: {c} hypothesis points ({100*c/len(hyp_n_roots):.1f}%)")
+    print(f"  mean={hyp_n_roots.mean():.3f}  RMS={hyp_n_roots.std():.4f}  entries={len(hyp_n_roots)}")
+
     print(f"Writing {OUTPUT_FILE} ...")
     with uproot.recreate(OUTPUT_FILE) as fout:
         fout["closure"] = {k: np.asarray(v) for k, v in rows.items()}
+        fout["hyp_roots"] = {"n_roots": hyp_n_roots}
     print("Done.")
 
 

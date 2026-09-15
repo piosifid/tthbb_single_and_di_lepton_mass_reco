@@ -3,9 +3,10 @@ import numpy as np
 import awkward as ak
 from numba import njit, float64
 from parton import mkPDF
-from custom_function import *
+import vector
+vector.register_awkward()
 
-_pdf_set = mkPDF("CT10", 0, pdfdir="/eos/user/p/piosifid/PocketCoffea/ANN_newCoffea/INF_DNN_new")
+_pdf_set = mkPDF("CT10", 0, pdfdir=".")
 
 def sign(x):
     """Return +1 for x >= 0, -1 for x < 0.
@@ -143,9 +144,45 @@ def quartic_solver(polx):
                 solutions.extend(
                     [root + shift for root in quadratic_solver([g / j, -h, 1])]
                 )
-
+                break  # any one valid h reconstructs all 4 roots of the quartic --
+                       # using more than one just re-derives the same roots with
+                       # extra floating-point noise, producing spurious "5th/6th/
+                       # 7th/8th root" artifacts the dedup tolerance can miss
     return solutions
 
+def count_quartic_real_roots(polx):
+    """Like quartic_solver, but returns the REAL root count WITH MULTIPLICITY
+    (always 0, 2, or 4 for a true quartic) instead of the list of distinct
+    values. A double root counts as 2, not 1 -- physically correct, unlike
+    len(quartic_solver(polx)), which dedups a double root's two coincident
+    roots down to a single distinct value (so it can report 1 or 3)."""
+    if abs(polx[4]) < TOL:
+        return len(cubic_solver(polx[:4]))
+    coeffs = [c / polx[4] for c in polx]
+    if abs(coeffs[0]) < TOL:
+        return 1 + len(cubic_solver(coeffs[1:5]))
+    e = coeffs[2] - 3 * coeffs[3]**2 / 8
+    f = coeffs[1] + coeffs[3]**3 / 8 - coeffs[2] * coeffs[3] / 2
+    g = coeffs[0] - 3 * coeffs[3]**4 / 256 + coeffs[3]**2 * coeffs[2] / 16 - coeffs[3] * coeffs[1] / 4
+    if abs(g) < TOL:
+        return 1 + len(cubic_solver([f, e, 0, 1]))
+    elif abs(f) < TOL:
+        count = 0
+        for z in quadratic_solver([g, e, 1]):
+            if z >= 0:
+                count += 2
+        return count
+    else:
+        resolvent = [-f**2, e**2 - 4 * g, 2 * e, 1]
+        for h_squared in cubic_solver(resolvent):
+            if h_squared > 0:
+                h = math.sqrt(h_squared)
+                j = (e + h_squared - f / h) / 2
+                d1 = h**2 - 4 * j
+                d2 = h**2 - 4 * (g / j)
+                return (2 if d1 > -TOL else 0) + (2 if d2 > -TOL else 0)
+        return 0
+ 
 def algebraic_pz(b, lp, mWp, mt, mb, mlp, pnux, pnuy):
     """
     Computes the z-component for the neutrino using algebraic methods.
@@ -1053,91 +1090,264 @@ def compute_jet_pair_properties_for_event(pt, eta, phi, mass, higgs_eta, higgs_p
 
     return phi_pairs, eta_pairs, mass_pairs, pt_pairs, delta_r_pairs, indices
 
-def dr_criterion_for_max_weight(events):
+def dr_criterion_for_max_weight(events, dr_threshold=1.9):
+    """
+    For each event, selects the best mass-reco Higgs pair combination by applying
+    a DR cut on the Higgs jet pair. Iterates through combinations ranked by PDF
+    weight (max -> second -> third -> fourth) and picks the first with DR < dr_threshold.
+    If none pass the DR cut, falls back to max_weight (trusting the PDF weight).
+    """
     t = len(events)
-    massreco_chosen_pair_higgs_mass_1 = []
-    massreco_chosen_pair_top_mass_1 = []
-    massreco_chosen_pair_W_mass_1 = []
-    massreco_chosen_pair_ttH_mass_1 = []
+
+    # --- Original outputs ---
+    massreco_chosen_pair_higgs_mass_1  = []
+    massreco_chosen_pair_top_mass_1    = []
+    massreco_chosen_pair_W_mass_1      = []
+    massreco_chosen_pair_ttH_mass_1    = []
     massreco_chosen_pair_combination_1 = []
+
+    # --- All-events per-rank DR and mass (regardless of which rank was selected) ---
+    rank_used_1        = []
+    dr_rank1_1         = []
+    dr_rank2_1         = []
+    dr_rank3_1         = []
+    dr_rank4_1         = []
+    dr_chosen_1        = []
+    higgs_mass_rank1_1 = []
+    higgs_mass_rank2_1 = []
+    higgs_mass_rank3_1 = []
+    higgs_mass_rank4_1 = []
+    higgs_mass_chosen_1 = []
+
+    # --- Selected: filled only when that rank was the final choice ---
+    higgs_mass_chosen_from_rank1_1    = []
+    higgs_mass_chosen_from_rank2_1    = []
+    higgs_mass_chosen_from_rank3_1    = []
+    higgs_mass_chosen_from_rank4_1    = []
+    higgs_mass_chosen_from_fallback_1 = []
+    dr_chosen_from_rank1_1            = []
+    dr_chosen_from_rank2_1            = []
+    dr_chosen_from_rank3_1            = []
+    dr_chosen_from_rank4_1            = []
+    dr_chosen_from_fallback_1         = []
+
+    # --- Rejected: filled only when that rank was skipped in favour of a lower rank ---
+    # rank1 rejected = rank was promoted to 2, 3, or 4
+    # rank2 rejected = rank was promoted to 3 or 4
+    # rank3 rejected = rank was promoted to 4
+    # rank4 rejected = fallback (rank4 tried but also failed DR cut -> back to rank1)
+    higgs_mass_rank1_rejected_1 = []
+    higgs_mass_rank2_rejected_1 = []
+    higgs_mass_rank3_rejected_1 = []
+    higgs_mass_rank4_rejected_1 = []
+    dr_rank1_rejected_1         = []
+    dr_rank2_rejected_1         = []
+    dr_rank3_rejected_1         = []
+    dr_rank4_rejected_1         = []
+
+    n_fallback  = 0
+    n_promoted  = 0
+    n_no_reco   = 0
+    rank_counts = {1: 0, 2: 0, 3: 0, 4: 0, 0: 0}
 
     for event_idx in range(t):
         jet_eta = events["JetGood"]["eta"][event_idx]
         jet_phi = events["JetGood"]["phi"][event_idx]
 
-        dr_1 = dr_2 = dr_3 = dr_4 = None
-        #hj1 = hj2 = hj1_2 = hj2_2 = hj1_3 = hj2_3 = -1
-
-        max_comb = events["max_weight_combination"][event_idx]
+        max_comb    = events["max_weight_combination"][event_idx]
         second_comb = events["second_max_weight_combination"][event_idx]
-        third_comb = events["third_max_weight_combination"][event_idx]
+        third_comb  = events["third_max_weight_combination"][event_idx]
         fourth_comb = events["fourth_max_weight_combination"][event_idx]
 
-        if max_comb is not None:
-            hj1 = max_comb["2"]
-            hj2 = max_comb["3"]
-            original_hj1 = get_original_jet_idx(events, event_idx, hj1)
-            original_hj2 = get_original_jet_idx(events, event_idx, hj2)
-            if original_hj1 < len(jet_eta) and original_hj2 < len(jet_eta):
-                dr_1 = calculate_dr(jet_eta[original_hj1], jet_phi[original_hj1], jet_eta[original_hj2], jet_phi[original_hj2])
-                #print(f"Event {event_idx} - Max Weight Combination: {max_comb}, Max Weight: {events['max_weight'][event_idx]}, ΔR: {dr_1}")
+        if max_comb is None:
+            n_no_reco += 1
+            massreco_chosen_pair_higgs_mass_1.append(None)
+            massreco_chosen_pair_top_mass_1.append(None)
+            massreco_chosen_pair_W_mass_1.append(None)
+            massreco_chosen_pair_ttH_mass_1.append(None)
+            massreco_chosen_pair_combination_1.append(None)
+            rank_used_1.append(None)
+            dr_rank1_1.append(None)
+            dr_rank2_1.append(None)
+            dr_rank3_1.append(None)
+            dr_rank4_1.append(None)
+            dr_chosen_1.append(None)
+            higgs_mass_rank1_1.append(None)
+            higgs_mass_rank2_1.append(None)
+            higgs_mass_rank3_1.append(None)
+            higgs_mass_rank4_1.append(None)
+            higgs_mass_chosen_1.append(None)
+            higgs_mass_chosen_from_rank1_1.append(None)
+            higgs_mass_chosen_from_rank2_1.append(None)
+            higgs_mass_chosen_from_rank3_1.append(None)
+            higgs_mass_chosen_from_rank4_1.append(None)
+            higgs_mass_chosen_from_fallback_1.append(None)
+            dr_chosen_from_rank1_1.append(None)
+            dr_chosen_from_rank2_1.append(None)
+            dr_chosen_from_rank3_1.append(None)
+            dr_chosen_from_rank4_1.append(None)
+            dr_chosen_from_fallback_1.append(None)
+            higgs_mass_rank1_rejected_1.append(None)
+            higgs_mass_rank2_rejected_1.append(None)
+            higgs_mass_rank3_rejected_1.append(None)
+            higgs_mass_rank4_rejected_1.append(None)
+            dr_rank1_rejected_1.append(None)
+            dr_rank2_rejected_1.append(None)
+            dr_rank3_rejected_1.append(None)
+            dr_rank4_rejected_1.append(None)
+            continue
 
-        if second_comb is not None:
-            hj1_2 = second_comb["2"]
-            hj2_2 = second_comb["3"]
-            original_hj1_2 = get_original_jet_idx(events, event_idx, hj1_2)
-            original_hj2_2 = get_original_jet_idx(events, event_idx, hj2_2)
-            if original_hj1_2 < len(jet_eta) and original_hj2_2 < len(jet_eta):
-                dr_2 = calculate_dr(jet_eta[original_hj1_2], jet_phi[original_hj1_2], jet_eta[original_hj2_2], jet_phi[original_hj2_2])
-                #print(f"Event {event_idx} - 2nd Max Weight Combination: {second_comb}, 2nd Max Weight: {events['second_max_weight'][event_idx]}, ΔR: {dr_2}")
+        def get_dr(comb):
+            if comb is None:
+                return None
+            hj1 = get_original_jet_idx(events, event_idx, comb["2"])
+            hj2 = get_original_jet_idx(events, event_idx, comb["3"])
+            if hj1 is None or hj2 is None:
+                return None
+            if hj1 >= len(jet_eta) or hj2 >= len(jet_eta):
+                return None
+            return calculate_dr(jet_eta[hj1], jet_phi[hj1],
+                                jet_eta[hj2], jet_phi[hj2])
 
-        if third_comb is not None:
-            hj1_3 = third_comb["2"]
-            hj2_3 = third_comb["3"]
-            original_hj1_3 = get_original_jet_idx(events, event_idx, hj1_3)
-            original_hj2_3 = get_original_jet_idx(events, event_idx, hj2_3)
-            if original_hj1_3 < len(jet_eta) and original_hj2_3 < len(jet_eta):
-                dr_3 = calculate_dr(jet_eta[original_hj1_3], jet_phi[original_hj1_3], jet_eta[original_hj2_3], jet_phi[original_hj2_3])
-                #print(f"Event {event_idx} - 3rd Max Weight Combination: {third_comb}, 3rd Max Weight: {events['third_max_weight'][event_idx]}, ΔR: {dr_3}")
+        # Compute DR for all four ranks
+        dr_1 = get_dr(max_comb)
+        dr_2 = get_dr(second_comb)
+        dr_3 = get_dr(third_comb)
+        dr_4 = get_dr(fourth_comb)
 
-        if fourth_comb is not None:
-            hj1_4 = fourth_comb["2"]
-            hj2_4 = fourth_comb["3"]
-            original_hj1_4 = get_original_jet_idx(events, event_idx, hj1_4)
-            original_hj2_4 = get_original_jet_idx(events, event_idx, hj2_4)
-            if original_hj1_4 < len(jet_eta) and original_hj2_4 < len(jet_eta):
-                dr_4 = calculate_dr(jet_eta[original_hj1_4], jet_phi[original_hj1_4], jet_eta[original_hj2_4], jet_phi[original_hj2_4])
-                #print(f"Event {event_idx} - 4th Max Weight Combination: {fourth_comb}, 3rd Max Weight: {events['fourth_max_weight'][event_idx]}, ΔR: {dr_4}")
+        # Store DR and mass for all ranks unconditionally
+        dr_rank1_1.append(dr_1)
+        dr_rank2_1.append(dr_2)
+        dr_rank3_1.append(dr_3)
+        dr_rank4_1.append(dr_4)
+        m1 = events["max_weight_higgs_mass"][event_idx]
+        m2 = events["second_max_weight_higgs_mass"][event_idx]
+        m3 = events["third_max_weight_higgs_mass"][event_idx]
+        m4 = events["fourth_max_weight_higgs_mass"][event_idx]
+        higgs_mass_rank1_1.append(m1)
+        higgs_mass_rank2_1.append(m2)
+        higgs_mass_rank3_1.append(m3)
+        higgs_mass_rank4_1.append(m4)
 
-        k = 1.9
-        if dr_1 is not None and dr_1 < k:
+        # Select best combination
+        if dr_1 is not None and dr_1 < dr_threshold:
             comb_key = "max_weight"
-        elif dr_2 is not None and dr_2 < k:
+            rank = 1
+        elif dr_2 is not None and dr_2 < dr_threshold:
             comb_key = "second_max_weight"
-        elif dr_3 is not None and dr_3 < k:
+            rank = 2
+            n_promoted += 1
+        elif dr_3 is not None and dr_3 < dr_threshold:
             comb_key = "third_max_weight"
-        elif dr_4 is not None and dr_4 < k:
+            rank = 3
+            n_promoted += 1
+        elif dr_4 is not None and dr_4 < dr_threshold:
             comb_key = "fourth_max_weight"
+            rank = 4
+            n_promoted += 1
         else:
-            comb_key = "max_weight"  # Default
-            
-        #print(f"Event {event_idx} - 4th Max Weight Combination: {comb_key}, 3rd Max Weight: { events[f'{comb_key}'][event_idx] }, ΔR1: {dr_1}, ΔR2: {dr_2}, ΔR3: {dr_3}, ΔR4: {dr_4}")
-        massreco_chosen_pair_higgs_mass_1.append(events[f"{comb_key}_higgs_mass"][event_idx])
+            comb_key = "max_weight"
+            rank = 0
+            n_fallback += 1
+
+        rank_counts[rank] += 1
+        rank_used_1.append(rank)
+
+        chosen_higgs_mass = events[f"{comb_key}_higgs_mass"][event_idx]
+        chosen_dr = dr_1 if rank in (1, 0) else (dr_2 if rank == 2 else (dr_3 if rank == 3 else dr_4))
+
+        dr_chosen_1.append(chosen_dr)
+        higgs_mass_chosen_1.append(chosen_higgs_mass)
+
+        massreco_chosen_pair_higgs_mass_1.append(chosen_higgs_mass)
         massreco_chosen_pair_top_mass_1.append(events[f"{comb_key}_top_mass"][event_idx])
         massreco_chosen_pair_W_mass_1.append(events[f"{comb_key}_W_mass"][event_idx])
         massreco_chosen_pair_ttH_mass_1.append(events[f"{comb_key}_ttH_mass"][event_idx])
         massreco_chosen_pair_combination_1.append(events[f"{comb_key}_combination"][event_idx])
 
-    res = {
-        "massreco_chosen_pair_higgs_mass": massreco_chosen_pair_higgs_mass_1,
-        "massreco_chosen_pair_top_mass": massreco_chosen_pair_top_mass_1,
-        "massreco_chosen_pair_W_mass": massreco_chosen_pair_W_mass_1,
-        "massreco_chosen_pair_ttH_mass": massreco_chosen_pair_ttH_mass_1,
-        "massreco_chosen_pair_combination": massreco_chosen_pair_combination_1
-    }
-    
-    return res
+        # --- Selected: only the chosen rank gets filled ---
+        higgs_mass_chosen_from_rank1_1.append(chosen_higgs_mass if rank == 1 else None)
+        higgs_mass_chosen_from_rank2_1.append(chosen_higgs_mass if rank == 2 else None)
+        higgs_mass_chosen_from_rank3_1.append(chosen_higgs_mass if rank == 3 else None)
+        higgs_mass_chosen_from_rank4_1.append(chosen_higgs_mass if rank == 4 else None)
+        higgs_mass_chosen_from_fallback_1.append(chosen_higgs_mass if rank == 0 else None)
+        dr_chosen_from_rank1_1.append(chosen_dr if rank == 1 else None)
+        dr_chosen_from_rank2_1.append(chosen_dr if rank == 2 else None)
+        dr_chosen_from_rank3_1.append(chosen_dr if rank == 3 else None)
+        dr_chosen_from_rank4_1.append(chosen_dr if rank == 4 else None)
+        dr_chosen_from_fallback_1.append(chosen_dr if rank == 0 else None)
 
+        # --- Rejected: filled when that rank was skipped ---
+        # rank1 rejected: when promoted to rank 2, 3, or 4
+        higgs_mass_rank1_rejected_1.append(m1 if rank in (2, 3, 4) else None)
+        dr_rank1_rejected_1.append(dr_1 if rank in (2, 3, 4) else None)
+        # rank2 rejected: when promoted to rank 3 or 4
+        higgs_mass_rank2_rejected_1.append(m2 if rank in (3, 4) else None)
+        dr_rank2_rejected_1.append(dr_2 if rank in (3, 4) else None)
+        # rank3 rejected: when promoted to rank 4
+        higgs_mass_rank3_rejected_1.append(m3 if rank == 4 else None)
+        dr_rank3_rejected_1.append(dr_3 if rank == 4 else None)
+        # rank4 rejected: when fallback (rank4 tried but also failed DR cut)
+        higgs_mass_rank4_rejected_1.append(m4 if rank == 0 else None)
+        dr_rank4_rejected_1.append(dr_4 if rank == 0 else None)
+
+    # --- Summary ---
+    n_with_reco = t - n_no_reco
+    print(f"\n=== dr_criterion_for_max_weight (threshold={dr_threshold}) ===")
+    print(f"  Total events              : {t}")
+    print(f"  No reco solution          : {n_no_reco}  ({100*n_no_reco/max(1,t):.1f}%)")
+    print(f"  --- Of events with reco ({n_with_reco}) ---")
+    print(f"  Rank 1 used (DR < {dr_threshold})  : {rank_counts[1]}  ({100*rank_counts[1]/max(1,n_with_reco):.1f}%)")
+    print(f"  Rank 2 promoted           : {rank_counts[2]}  ({100*rank_counts[2]/max(1,n_with_reco):.1f}%)")
+    print(f"  Rank 3 promoted           : {rank_counts[3]}  ({100*rank_counts[3]/max(1,n_with_reco):.1f}%)")
+    print(f"  Rank 4 promoted           : {rank_counts[4]}  ({100*rank_counts[4]/max(1,n_with_reco):.1f}%)")
+    print(f"  Fallback (no rank < {dr_threshold}) : {rank_counts[0]}  ({100*rank_counts[0]/max(1,n_with_reco):.1f}%)")
+    print(f"  Total promoted (2/3/4)    : {n_promoted}  ({100*n_promoted/max(1,n_with_reco):.1f}%)")
+    print(f"  DR criterion overrides    : {n_promoted + rank_counts[0]}  ({100*(n_promoted+rank_counts[0])/max(1,n_with_reco):.1f}%)")
+    print(f"=======================================================\n")
+
+    res = {
+        # Original outputs
+        "massreco_chosen_pair_higgs_mass":   massreco_chosen_pair_higgs_mass_1,
+        "massreco_chosen_pair_top_mass":     massreco_chosen_pair_top_mass_1,
+        "massreco_chosen_pair_W_mass":       massreco_chosen_pair_W_mass_1,
+        "massreco_chosen_pair_ttH_mass":     massreco_chosen_pair_ttH_mass_1,
+        "massreco_chosen_pair_combination":  massreco_chosen_pair_combination_1,
+        # All-events per-rank
+        "rank_used":           rank_used_1,
+        "dr_rank1":            dr_rank1_1,
+        "dr_rank2":            dr_rank2_1,
+        "dr_rank3":            dr_rank3_1,
+        "dr_rank4":            dr_rank4_1,
+        "dr_chosen":           dr_chosen_1,
+        "higgs_mass_rank1":    higgs_mass_rank1_1,
+        "higgs_mass_rank2":    higgs_mass_rank2_1,
+        "higgs_mass_rank3":    higgs_mass_rank3_1,
+        "higgs_mass_rank4":    higgs_mass_rank4_1,
+        "higgs_mass_chosen":   higgs_mass_chosen_1,
+        # Selected-from-rank
+        "higgs_mass_chosen_from_rank1":    higgs_mass_chosen_from_rank1_1,
+        "higgs_mass_chosen_from_rank2":    higgs_mass_chosen_from_rank2_1,
+        "higgs_mass_chosen_from_rank3":    higgs_mass_chosen_from_rank3_1,
+        "higgs_mass_chosen_from_rank4":    higgs_mass_chosen_from_rank4_1,
+        "higgs_mass_chosen_from_fallback": higgs_mass_chosen_from_fallback_1,
+        "dr_chosen_from_rank1":            dr_chosen_from_rank1_1,
+        "dr_chosen_from_rank2":            dr_chosen_from_rank2_1,
+        "dr_chosen_from_rank3":            dr_chosen_from_rank3_1,
+        "dr_chosen_from_rank4":            dr_chosen_from_rank4_1,
+        "dr_chosen_from_fallback":         dr_chosen_from_fallback_1,
+        # Rejected-from-rank
+        "higgs_mass_rank1_rejected":       higgs_mass_rank1_rejected_1,
+        "higgs_mass_rank2_rejected":       higgs_mass_rank2_rejected_1,
+        "higgs_mass_rank3_rejected":       higgs_mass_rank3_rejected_1,
+        "higgs_mass_rank4_rejected":       higgs_mass_rank4_rejected_1,
+        "dr_rank1_rejected":               dr_rank1_rejected_1,
+        "dr_rank2_rejected":               dr_rank2_rejected_1,
+        "dr_rank3_rejected":               dr_rank3_rejected_1,
+        "dr_rank4_rejected":               dr_rank4_rejected_1,
+    }
+    return res
+    
 def get_original_jet_idx(events, event_idx, hj):
     if hj == 0:
         return ak.to_numpy(events["1st_jet_idx"])[event_idx]
@@ -1150,123 +1360,1174 @@ def get_original_jet_idx(events, event_idx, hj):
     else:
         return None
 
-def skip_event():
-    pair_phi.append([])
-    pair_eta.append([])
-    pair_phi.append([])
-    pair_eta.append([])
-    pair_mass.append([])
-    pair_pt.append([])
-    pair_indices.append([])
-    pair_dr.append([])
-    numerators.append([])
-    denominators.append([])
-    correct_matches.append([])
-    correct_agreements.append([])
-    firstandsecondmaxweight_higgs_mass_1.append([])
-    massreco_chosen_pair_correct_higgs_mass_1.append([])
-    massreco_chosen_pair_all_higgs_mass_1.append([])
-    massreco_chosen_pair_wrong_higgs_mass_1.append([])
-    massreco_chosen_pair_wrong_higgs_mass_2_jets_1.append([])
-    massreco_chosen_pair_wrong_higgs_mass_1_jets_1.append([])
-    massreco_chosen_pair_correct_top_mass_1.append([])
-    massreco_chosen_pair_wrong_top_mass_1.append([])
-    massreco_chosen_pair_correct_W_mass_1.append([])
-    massreco_chosen_pair_wrong_W_mass_1.append([])
-    massreco_chosen_pair_correct_ttH_mass_1.append([])
-    massreco_chosen_pair_wrong_ttH_mass_1.append([])
-    massreco_chosen_pair_correct_jet_pt_1.append([])
-    massreco_chosen_pair_wrong_jet_pt_1.append([])
-    massreco_chosen_pair_correct_jet_phi_1.append([])
-    massreco_chosen_pair_wrong_jet_phi_1.append([])
-    massreco_chosen_pair_correct_jet_eta_1.append([])
-    massreco_chosen_pair_wrong_jet_eta_1.append([])
-    massreco_chosen_pair_correct_jet_mult_1.append([])
-    massreco_chosen_pair_wrong_jet_mult_1.append([])
-    massreco_chosen_pair_wrong_dr_1.append([])
-    massreco_chosen_pair_correct_dr_1.append([])
-    massreco_chosen_pair_wrong_delta_angle_1.append([])
-    massreco_chosen_pair_correct_delta_angle_1.append([])
-    massreco_chosen_pair_wrong_dr_top_1.append([])
-    massreco_chosen_pair_correct_dr_top_1.append([]) 
-    massreco_chosen_pair_wrong_lep_neg_1.append([]) 
-    massreco_chosen_pair_correct_lep_neg_1.append([])     
-    massreco_chosen_pair_wrong_lep_pos_1.append([]) 
-    massreco_chosen_pair_correct_lep_pos_1.append([]) 
-    massreco_chosen_pair_wrong_pt_assymetry_1.append([])
-    massreco_chosen_pair_correct_pt_assymetry_1.append([])
-    massreco_chosen_pair_correct_jet_btag_score_1.append([None, None])
-    massreco_chosen_pair_wrong_jet_btag_score_1.append([None, None])
+
+def get_solver_jet_indices(events, event_idx):
+    """
+    Returns the JetGood-array indices of the jets actually available to
+    solve_ttbar_dilepton()'s combinatorics for this event.
+
+    Reads events["1st_jet_idx".."4th_jet_idx"] -- whichever ordering
+    criterion workflow_mc.py used to build them (pT now, previously
+    btag) -- instead of independently recomputing a hardcoded btag-based
+    top-4. This keeps the acceptance check (could the solver possibly
+    have found the truth pair?) automatically consistent with whatever
+    jets the solver was actually given.
+
+    Only the first 4 are included: solve_ttbar_dilepton() hardcodes
+    n_jets = 4 for its combinatorics loop, so even though a 5th jet is
+    sometimes appended to its local `jets` list, it is never actually
+    reached by `for i in range(n_jets)` (range(4)). If that n_jets bound
+    is ever changed to use the 5th jet too, "5th_jet_idx" should be added
+    here as well.
+    """
+    idx_fields = ["1st_jet_idx", "2nd_jet_idx", "3rd_jet_idx", "4th_jet_idx"]
+    indices = []
+    for f in idx_fields:
+        if f not in ak.fields(events):
+            continue
+        val = events[f][event_idx]
+        if val is None:
+            continue
+        indices.append(int(val))
+    return indices
 
 
+def compute_jet_pair_properties_all_events(events, j_matched, q_matched, prefix="max_weight", btag_branch="btagUParTAK4B"):
 
-def compute_jet_pair_properties_all_events(events):
-    massreco_chosen_pair_dr_1 = []
-    massreco_chosen_pair_delta_angle_1 = []
-    pull_magnitude_list = []
-    pull_angle_list = []
-    pull_magnitude_diff_list = []
-    pull_angle_diff_list = []
+    pair_phi, pair_eta, pair_mass, pair_pt, pair_indices, pair_dr = [], [], [], [], [], []
+    original_jet_pair_indices = []
+    numerators = []
+    denominators = []
+    correct_matches = []
+    correct_agreements = []
+    higgs_mass_truth_jets_1 = []
+    firstandsecondmaxweight_higgs_mass_1 = []
+    massreco_chosen_pair_correct_higgs_mass_1 = []
+    massreco_chosen_pair_all_higgs_mass_1 = []
+    massreco_chosen_pair_wrong_higgs_mass_1 = []
+    massreco_chosen_pair_wrong_higgs_mass_2_jets_1 = []
+    massreco_chosen_pair_wrong_higgs_mass_1_jets_1 = []
+    massreco_chosen_pair_correct_top_mass_1 = []
+    massreco_chosen_pair_wrong_top_mass_1 = []
+    massreco_chosen_pair_correct_W_mass_1 = []
+    massreco_chosen_pair_wrong_W_mass_1 = []
+    massreco_chosen_pair_correct_ttH_mass_1 = []
+    massreco_chosen_pair_wrong_ttH_mass_1 = []
+    massreco_chosen_pair_correct_jet_pt_1 = []
+    massreco_chosen_pair_wrong_jet_pt_1 = []
+    massreco_chosen_pair_correct_jet_phi_1 = []
+    massreco_chosen_pair_wrong_jet_phi_1 = []
+    massreco_chosen_pair_correct_jet_eta_1 = []
+    massreco_chosen_pair_wrong_jet_eta_1 = []
+    massreco_chosen_pair_correct_jet_mult_1 = []
+    massreco_chosen_pair_wrong_jet_mult_1 = []
+    massreco_chosen_pair_wrong_dr_1 = []
+    massreco_chosen_pair_correct_dr_1 = []
+    massreco_chosen_pair_wrong_delta_angle_1 = []
+    massreco_chosen_pair_correct_delta_angle_1 = []
+    massreco_chosen_pair_wrong_pull_angle_1 = []
+    massreco_chosen_pair_correct_pull_angle_1 = []
+    massreco_chosen_pair_wrong_delta_magn_1 = []
+    massreco_chosen_pair_correct_delta_magn_1 = []
+    massreco_chosen_pair_wrong_pull_magn_1 = []
+    massreco_chosen_pair_correct_pull_magn_1 = []
+    massreco_chosen_pair_wrong_dr_top_1 = []
+    massreco_chosen_pair_correct_dr_top_1 = []
+    massreco_chosen_pair_wrong_lep_neg_1 = []
+    massreco_chosen_pair_correct_lep_neg_1 = []
+    massreco_chosen_pair_wrong_lep_pos_1 = []
+    massreco_chosen_pair_correct_lep_pos_1 = []
+    massreco_chosen_pair_wrong_pt_assymetry_1 = []
+    massreco_chosen_pair_correct_pt_assymetry_1 = []
+    massreco_chosen_pair_correct_jet_btag_score_1 = []
+    massreco_chosen_pair_wrong_jet_btag_score_1 = []
+
+    def skip_event():
+        pair_phi.append([])
+        pair_eta.append([])
+        pair_mass.append([])
+        pair_pt.append([])
+        pair_indices.append([])
+        pair_dr.append([])
+        numerators.append([])
+        denominators.append([])
+        correct_matches.append([])
+        correct_agreements.append([])
+        firstandsecondmaxweight_higgs_mass_1.append([])
+        higgs_mass_truth_jets_1.append([])
+        massreco_chosen_pair_correct_higgs_mass_1.append([])
+        massreco_chosen_pair_all_higgs_mass_1.append([])
+        massreco_chosen_pair_wrong_higgs_mass_1.append([])
+        massreco_chosen_pair_wrong_higgs_mass_2_jets_1.append([])
+        massreco_chosen_pair_wrong_higgs_mass_1_jets_1.append([])
+        massreco_chosen_pair_correct_top_mass_1.append([])
+        massreco_chosen_pair_wrong_top_mass_1.append([])
+        massreco_chosen_pair_correct_W_mass_1.append([])
+        massreco_chosen_pair_wrong_W_mass_1.append([])
+        massreco_chosen_pair_correct_ttH_mass_1.append([])
+        massreco_chosen_pair_wrong_ttH_mass_1.append([])
+        massreco_chosen_pair_correct_jet_pt_1.append([])
+        massreco_chosen_pair_wrong_jet_pt_1.append([])
+        massreco_chosen_pair_correct_jet_phi_1.append([])
+        massreco_chosen_pair_wrong_jet_phi_1.append([])
+        massreco_chosen_pair_correct_jet_eta_1.append([])
+        massreco_chosen_pair_wrong_jet_eta_1.append([])
+        massreco_chosen_pair_correct_jet_mult_1.append([])
+        massreco_chosen_pair_wrong_jet_mult_1.append([])
+        massreco_chosen_pair_wrong_dr_1.append([])
+        massreco_chosen_pair_correct_dr_1.append([])
+        massreco_chosen_pair_wrong_delta_angle_1.append([])
+        massreco_chosen_pair_correct_delta_angle_1.append([])
+        massreco_chosen_pair_wrong_delta_magn_1.append([])
+        massreco_chosen_pair_correct_delta_magn_1.append([])
+        massreco_chosen_pair_wrong_pull_angle_1.append([])
+        massreco_chosen_pair_correct_pull_angle_1.append([])
+        massreco_chosen_pair_wrong_pull_magn_1.append([])
+        massreco_chosen_pair_correct_pull_magn_1.append([])
+        massreco_chosen_pair_wrong_dr_top_1.append([])
+        massreco_chosen_pair_correct_dr_top_1.append([])
+        massreco_chosen_pair_wrong_lep_neg_1.append([])
+        massreco_chosen_pair_correct_lep_neg_1.append([])
+        massreco_chosen_pair_wrong_lep_pos_1.append([])
+        massreco_chosen_pair_correct_lep_pos_1.append([])
+        massreco_chosen_pair_wrong_pt_assymetry_1.append([])
+        massreco_chosen_pair_correct_pt_assymetry_1.append([])
+        massreco_chosen_pair_correct_jet_btag_score_1.append([None, None])
+        massreco_chosen_pair_wrong_jet_btag_score_1.append([None, None])
 
     t = len(events)
-    prefix = "max_weight"
 
+    ############## Loop over events ###########################
     for event_idx in range(t):
-        dr = None
-        delta_angle = None
-        pull_magnitude = [None, None]
-        pull_angle = [None, None]
-        pull_magnitude_diff = None
-        pull_angle_diff = None
 
-        comb = events[f"{prefix}_combination"][event_idx]
-        if comb is None:
-            massreco_chosen_pair_dr_1.append([None])
-            massreco_chosen_pair_delta_angle_1.append([None])
-            pull_magnitude_list.append(pull_magnitude)
-            pull_angle_list.append(pull_angle)
-            pull_magnitude_diff_list.append(pull_magnitude_diff)
-            pull_angle_diff_list.append(pull_angle_diff)
+        # --- Step 1: find truth-matched Higgs jet indices ---
+        higgs_matched_indices = [
+            idx for idx, parton in enumerate(q_matched[event_idx])
+            if parton is not None and parton.provenance == 1
+        ]
+        selected_jet_pair = higgs_matched_indices if len(higgs_matched_indices) == 2 else []
+
+        # Skip if we don't have exactly 2 truth-matched Higgs jets
+        if len(selected_jet_pair) != 2:
+            skip_event()
             continue
 
-        hj1 = comb["2"]
-        hj2 = comb["3"]
+        # --- Step 2: require the solver actually had >=4 jet candidates ---
+        solver_jet_indices = get_solver_jet_indices(events, event_idx)
+        if len(solver_jet_indices) < 4:
+            skip_event()
+            continue
 
-        original_hj1 = get_original_jet_idx(events, event_idx, hj1)
-        original_hj2 = get_original_jet_idx(events, event_idx, hj2)
+        # --- Step 3: require both truth jets are among the jets the solver
+        #     actually received (events["1st_jet_idx".."4th_jet_idx"] --
+        #     whichever ordering criterion is active in workflow_mc.py: pT
+        #     now, previously btag) ---
+        jet0, jet1 = selected_jet_pair
+        both_in_top4 = jet0 in solver_jet_indices and jet1 in solver_jet_indices
+        if event_idx < 5:
+            print(f"  [Event {event_idx}] truth_jets={selected_jet_pair}, "
+                  f"solver_jet_idx={solver_jet_indices}, "
+                  f"both_in_top4={both_in_top4}")
+        if not both_in_top4:
+            skip_event()
+            continue
 
-        if original_hj1 < len(events["JetGood"]["eta"][event_idx]) and original_hj2 < len(events["JetGood"]["eta"][event_idx]):
-            eta1 = events["JetGood"]["eta"][event_idx][original_hj1]
-            phi1 = events["JetGood"]["phi"][event_idx][original_hj1]
-            eta2 = events["JetGood"]["eta"][event_idx][original_hj2]
-            phi2 = events["JetGood"]["phi"][event_idx][original_hj2]
+        # --- Step 4: compute truth-pair invariant mass ---
+        pt1   = events["JetGood"]["pt"][event_idx][jet0]
+        eta1  = events["JetGood"]["eta"][event_idx][jet0]
+        phi1  = events["JetGood"]["phi"][event_idx][jet0]
+        mass1 = events["JetGood"]["mass"][event_idx][jet0]
+        pt2   = events["JetGood"]["pt"][event_idx][jet1]
+        eta2  = events["JetGood"]["eta"][event_idx][jet1]
+        phi2  = events["JetGood"]["phi"][event_idx][jet1]
+        mass2 = events["JetGood"]["mass"][event_idx][jet1]
 
-            pull_angle1 = events["JetGood"]["pull_angle"][event_idx][original_hj1]
-            pull_angle2 = events["JetGood"]["pull_angle"][event_idx][original_hj2]
+        p4_1 = vector.obj(pt=pt1, eta=eta1, phi=phi1, mass=mass1)
+        p4_2 = vector.obj(pt=pt2, eta=eta2, phi=phi2, mass=mass2)
+        higgs_mass_truth_jets = (p4_1 + p4_2).mass
 
+        # --- Step 5: check if mass reco produced a combination for this event ---
+        reco_combination = events[f"{prefix}_combination"][event_idx]
+
+        if reco_combination is None:
+            # Truth jets found but mass reco had no solution: record truth mass, zeros for match
+            higgs_mass_truth_jets_1.append([higgs_mass_truth_jets])
+            numerators.append([0.])
+            denominators.append([1.])
+            correct_matches.append([0.])
+            correct_agreements.append([0.])
+            # All output quantities are None/empty for this event
+            massreco_chosen_pair_all_higgs_mass_1.append([None])
+            massreco_chosen_pair_correct_higgs_mass_1.append([None])
+            massreco_chosen_pair_wrong_higgs_mass_1.append([None])
+            massreco_chosen_pair_wrong_higgs_mass_2_jets_1.append([None])
+            massreco_chosen_pair_wrong_higgs_mass_1_jets_1.append([None])
+            massreco_chosen_pair_correct_top_mass_1.append([None])
+            massreco_chosen_pair_wrong_top_mass_1.append([None])
+            massreco_chosen_pair_correct_W_mass_1.append([None])
+            massreco_chosen_pair_wrong_W_mass_1.append([None])
+            massreco_chosen_pair_correct_ttH_mass_1.append([None])
+            massreco_chosen_pair_wrong_ttH_mass_1.append([None])
+            massreco_chosen_pair_correct_jet_pt_1.append([None, None])
+            massreco_chosen_pair_wrong_jet_pt_1.append([None, None])
+            massreco_chosen_pair_correct_jet_eta_1.append([None, None])
+            massreco_chosen_pair_wrong_jet_eta_1.append([None, None])
+            massreco_chosen_pair_correct_jet_phi_1.append([None, None])
+            massreco_chosen_pair_wrong_jet_phi_1.append([None, None])
+            massreco_chosen_pair_correct_jet_mult_1.append([None])
+            massreco_chosen_pair_wrong_jet_mult_1.append([None])
+            massreco_chosen_pair_correct_dr_1.append([None])
+            massreco_chosen_pair_wrong_dr_1.append([None])
+            massreco_chosen_pair_correct_delta_angle_1.append([None])
+            massreco_chosen_pair_wrong_delta_angle_1.append([None])
+            massreco_chosen_pair_correct_delta_magn_1.append([None])
+            massreco_chosen_pair_wrong_delta_magn_1.append([None])
+            massreco_chosen_pair_correct_pull_angle_1.append([[np.nan, np.nan]])
+            massreco_chosen_pair_wrong_pull_angle_1.append([[np.nan, np.nan]])
+            massreco_chosen_pair_correct_pull_magn_1.append([[np.nan, np.nan]])
+            massreco_chosen_pair_wrong_pull_magn_1.append([[np.nan, np.nan]])
+            massreco_chosen_pair_correct_dr_top_1.append([None])
+            massreco_chosen_pair_wrong_dr_top_1.append([None])
+            massreco_chosen_pair_correct_lep_pos_1.append([None])
+            massreco_chosen_pair_wrong_lep_pos_1.append([None])
+            massreco_chosen_pair_correct_lep_neg_1.append([None])
+            massreco_chosen_pair_wrong_lep_neg_1.append([None])
+            massreco_chosen_pair_correct_pt_assymetry_1.append([None])
+            massreco_chosen_pair_wrong_pt_assymetry_1.append([None])
+            massreco_chosen_pair_correct_jet_btag_score_1.append([None, None])
+            massreco_chosen_pair_wrong_jet_btag_score_1.append([None, None])
+            pair_phi.append([])
+            pair_eta.append([])
+            pair_mass.append([])
+            pair_pt.append([])
+            pair_indices.append([])
+            pair_dr.append([])
+            firstandsecondmaxweight_higgs_mass_1.append([])
+            continue
+
+        # --- Step 6: read mass-reco Higgs jet assignments (FIX A: outside the loop) ---
+        hj1    = reco_combination["2"]
+        hj2    = reco_combination["3"]
+        j_top1 = reco_combination["0"]
+        j_top2 = reco_combination["1"]
+
+        original_hj1    = get_original_jet_idx(events, event_idx, hj1)
+        original_hj2    = get_original_jet_idx(events, event_idx, hj2)
+        original_j_top1 = get_original_jet_idx(events, event_idx, j_top1)
+        original_j_top2 = get_original_jet_idx(events, event_idx, j_top2)
+
+        n_jets_good = len(events["JetGood"]["eta"][event_idx])
+
+        # Guard against None returns from get_original_jet_idx (e.g. 5th jet case)
+        if original_hj1 is None or original_hj2 is None:
+            skip_event()
+            continue
+        if original_j_top1 is None or original_j_top2 is None:
+            skip_event()
+            continue
+
+        # --- Step 7: compute Higgs-pair kinematics from reco combination (FIX A: once, not per loop) ---
+        dr = delta_angle = pull_magnitude_diff = pull_angle_diff = None
+        pull_magnitude1 = pull_angle1 = pull_magnitude2 = pull_angle2 = np.nan
+        pt_assymetry = None
+
+        if original_hj1 < n_jets_good and original_hj2 < n_jets_good:
+            eta_hj1  = events["JetGood"]["eta"][event_idx][original_hj1]
+            phi_hj1  = events["JetGood"]["phi"][event_idx][original_hj1]
+            eta_hj2  = events["JetGood"]["eta"][event_idx][original_hj2]
+            phi_hj2  = events["JetGood"]["phi"][event_idx][original_hj2]
+
+            pull_angle1     = events["JetGood"]["pull_angle"][event_idx][original_hj1]
+            pull_angle2     = events["JetGood"]["pull_angle"][event_idx][original_hj2]
             pull_magnitude1 = events["JetGood"]["pull_magnitude"][event_idx][original_hj1]
             pull_magnitude2 = events["JetGood"]["pull_magnitude"][event_idx][original_hj2]
 
-            dr = calculate_dr(eta1, phi1, eta2, phi2)
-            delta_angle = pull_angle1 - pull_angle2
+            dr                = calculate_dr(eta_hj1, phi_hj1, eta_hj2, phi_hj2)
+            delta_angle       = pull_angle1 - pull_angle2
             pull_magnitude_diff = pull_magnitude1 - pull_magnitude2
-            pull_angle_diff = pull_angle1 - pull_angle2
+            pull_angle_diff   = pull_angle1 - pull_angle2
 
-            pull_magnitude = [pull_magnitude1, pull_magnitude2]
-            pull_angle = [pull_angle1, pull_angle2]
+            pt_hj1 = events["JetGood"]["pt"][event_idx][original_hj1]
+            pt_hj2 = events["JetGood"]["pt"][event_idx][original_hj2]
+            pt_assymetry = calculate_pt_asymmetry(pt_hj1, pt_hj2)
 
-        massreco_chosen_pair_dr_1.append([dr])
-        massreco_chosen_pair_delta_angle_1.append([delta_angle])
-        pull_magnitude_list.append(pull_magnitude)
-        pull_angle_list.append(pull_angle)
-        pull_magnitude_diff_list.append(pull_magnitude_diff)
-        pull_angle_diff_list.append(pull_angle_diff)
+        # --- Step 8: compute top-b-jet kinematics ---
+        dr_top = None
+        pt_asymmetry_top = None
+        eta_top1 = phi_top1 = eta_top2 = phi_top2 = None  # initialise before lepton block
 
-    return {
-        "massreco_chosen_pair_dr": massreco_chosen_pair_dr_1,
-        "massreco_chosen_pair_delta_angle": massreco_chosen_pair_delta_angle_1,
-        "pull_magnitude": pull_magnitude_list,
-        "pull_angle": pull_angle_list,
-        "pull_magnitude_diff": pull_magnitude_diff_list,
-        "pull_angle_diff": pull_angle_diff_list,
+        if original_j_top1 < n_jets_good and original_j_top2 < n_jets_good:
+            eta_top1 = events["JetGood"]["eta"][event_idx][original_j_top1]
+            phi_top1 = events["JetGood"]["phi"][event_idx][original_j_top1]
+            eta_top2 = events["JetGood"]["eta"][event_idx][original_j_top2]
+            phi_top2 = events["JetGood"]["phi"][event_idx][original_j_top2]
+            dr_top = calculate_dr(eta_top1, phi_top1, eta_top2, phi_top2)
+
+            pt_top1 = events["JetGood"]["pt"][event_idx][original_j_top1]
+            pt_top2 = events["JetGood"]["pt"][event_idx][original_j_top2]
+            pt_asymmetry_top = calculate_pt_asymmetry(pt_top1, pt_top2)
+
+        # --- Step 9: compute lepton-to-top-jet ΔR (FIX B+C: guarded + corrected logic) ---
+        dr_min_pos = dr_min_neg = None
+        lep_pos = events["lepton_pos"][event_idx]
+        lep_neg = events["lepton_neg"][event_idx]
+
+        if (len(lep_pos) == 1 and len(lep_neg) == 1
+                and eta_top1 is not None and eta_top2 is not None):  # FIX B: guard
+
+            eta_pos, phi_pos = lep_pos["eta"][0], lep_pos["phi"][0]
+            eta_neg, phi_neg = lep_neg["eta"][0], lep_neg["phi"][0]
+
+            dr1_pos = calculate_dr(eta_top1, phi_top1, eta_pos, phi_pos)
+            dr2_pos = calculate_dr(eta_top2, phi_top2, eta_pos, phi_pos)
+            dr1_neg = calculate_dr(eta_top1, phi_top1, eta_neg, phi_neg)
+            dr2_neg = calculate_dr(eta_top2, phi_top2, eta_neg, phi_neg)
+
+            # Closest jet to positive lepton
+            if dr1_pos < dr2_pos:
+                closest_jet_to_lep_pos = original_j_top1
+                dr_min_pos = dr1_pos
+            else:
+                closest_jet_to_lep_pos = original_j_top2
+                dr_min_pos = dr2_pos
+
+            # FIX C: assign the *other* jet to lep_neg, irrespective of which ΔR is smaller
+            if closest_jet_to_lep_pos == original_j_top1:
+                dr_min_neg = dr2_neg
+            else:
+                dr_min_neg = dr1_neg
+
+        # --- Step 10: determine match category (FIX A: plain comparison, not inside loop) ---
+        first_match  = 1. if jet0 == original_hj1 or jet1 == original_hj1 else 0.
+        second_match = 1. if jet0 == original_hj2 or jet1 == original_hj2 else 0.
+
+        # FIX B (correct_match semantics): derive cleanly from first/second match
+        if first_match == 1. and second_match == 1.:
+            correct_match = 2.   # both Higgs jets correctly identified
+        elif first_match == 1. or second_match == 1.:
+            correct_match = 1.   # one Higgs jet correctly identified
+        else:
+            correct_match = 0.   # neither Higgs jet correctly identified
+
+        denominator = 1.
+        numerator   = 1. if correct_match > 0. else 0.
+
+        # --- Block 2: per-event match decision (first 10 events) ---
+        if event_idx < 10:
+            reco_mass = events[f"{prefix}_higgs_mass"][event_idx]
+            print(f"\n--- Event {event_idx} ---")
+            print(f"  Truth Higgs jets (JetGood idx) : {selected_jet_pair}")
+            print(f"  Reco Higgs slots (btag-sorted) : hj1={hj1}, hj2={hj2}")
+            print(f"  Reco Higgs jets (JetGood idx)  : original_hj1={original_hj1}, original_hj2={original_hj2}")
+            print(f"  first_match={first_match}, second_match={second_match}, correct_match={correct_match}")
+            print(f"  higgs_mass_truth = {higgs_mass_truth_jets:.2f} GeV")
+            print(f"  higgs_mass_reco  = {reco_mass:.2f} GeV" if reco_mass is not None else "  higgs_mass_reco  = None")
+            print(f"  DR(reco Higgs pair) = {dr:.3f}" if dr is not None else "  DR(reco Higgs pair) = None")
+
+        # --- Step 11: fill per-case output variables ---
+        # Initialise all to None / nan
+        massreco_chosen_pair_wrong_higgs_mass        = None
+        massreco_chosen_pair_wrong_higgs_mass_2_jets = None
+        massreco_chosen_pair_wrong_higgs_mass_1_jets = None
+        massreco_chosen_pair_correct_higgs_mass      = None
+        massreco_chosen_pair_all_higgs_mass          = None
+        massreco_chosen_pair_wrong_top_mass          = None
+        massreco_chosen_pair_correct_top_mass        = None
+        massreco_chosen_pair_wrong_W_mass            = None
+        massreco_chosen_pair_correct_W_mass          = None
+        massreco_chosen_pair_wrong_ttH_mass          = None
+        massreco_chosen_pair_correct_ttH_mass        = None
+        massreco_chosen_pair_correct_jet_pt          = None
+        massreco_chosen_pair_wrong_jet_pt            = None
+        massreco_chosen_pair_correct_jet_pt_second   = None
+        massreco_chosen_pair_wrong_jet_pt_second     = None
+        massreco_chosen_pair_correct_jet_eta         = None
+        massreco_chosen_pair_wrong_jet_eta           = None
+        massreco_chosen_pair_correct_jet_eta_second  = None
+        massreco_chosen_pair_wrong_jet_eta_second    = None
+        massreco_chosen_pair_correct_jet_phi         = None
+        massreco_chosen_pair_wrong_jet_phi           = None
+        massreco_chosen_pair_correct_jet_phi_second  = None
+        massreco_chosen_pair_wrong_jet_phi_second    = None
+        massreco_chosen_pair_correct_jet_btag_score        = None
+        massreco_chosen_pair_correct_jet_btag_score_second = None
+        massreco_chosen_pair_wrong_jet_btag_score          = None
+        massreco_chosen_pair_wrong_jet_btag_score_second   = None
+        massreco_chosen_pair_correct_jet_mult        = None
+        massreco_chosen_pair_wrong_jet_mult          = None
+        massreco_chosen_pair_correct_dr              = None
+        massreco_chosen_pair_wrong_dr                = None
+        massreco_chosen_pair_correct_delta_angle     = None
+        massreco_chosen_pair_wrong_delta_angle       = None
+        massreco_chosen_pair_correct_delta_magn      = None
+        massreco_chosen_pair_wrong_delta_magn        = None
+        massreco_chosen_pair_correct_pull_angle      = [np.nan, np.nan]
+        massreco_chosen_pair_wrong_pull_angle        = [np.nan, np.nan]
+        massreco_chosen_pair_correct_pull_magn       = [np.nan, np.nan]
+        massreco_chosen_pair_wrong_pull_magn         = [np.nan, np.nan]
+        massreco_chosen_pair_correct_dr_top          = None
+        massreco_chosen_pair_wrong_dr_top            = None
+        massreco_chosen_pair_correct_lep_pos         = None
+        massreco_chosen_pair_wrong_lep_pos           = None
+        massreco_chosen_pair_correct_lep_neg         = None
+        massreco_chosen_pair_wrong_lep_neg           = None
+        massreco_chosen_pair_correct_pt_assymetry    = None
+        massreco_chosen_pair_wrong_pt_assymetry      = None
+
+        # ----- case: first jet matched, second wrong -----
+        if first_match == 1. and second_match == 0.:
+            massreco_chosen_pair_wrong_higgs_mass_1_jets = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_higgs_mass   = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_all_higgs_mass     = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_top_mass     = events[f"{prefix}_top_mass"][event_idx]
+            massreco_chosen_pair_wrong_W_mass       = events[f"{prefix}_W_mass"][event_idx]
+            massreco_chosen_pair_wrong_ttH_mass     = events[f"{prefix}_ttH_mass"][event_idx]
+            massreco_chosen_pair_wrong_dr           = dr
+            massreco_chosen_pair_wrong_dr_top       = dr_top
+            massreco_chosen_pair_wrong_lep_pos      = dr_min_pos
+            massreco_chosen_pair_wrong_lep_neg      = dr_min_neg
+            massreco_chosen_pair_wrong_pt_assymetry = pt_assymetry
+            massreco_chosen_pair_wrong_delta_angle  = delta_angle
+            massreco_chosen_pair_wrong_delta_magn   = pull_magnitude_diff
+            massreco_chosen_pair_wrong_jet_mult     = events["nJetGood"][event_idx]
+            massreco_chosen_pair_correct_pull_magn  = [pull_magnitude1, np.nan]
+            massreco_chosen_pair_correct_pull_angle = [pull_angle1, np.nan]
+            massreco_chosen_pair_wrong_pull_magn   = [np.nan, pull_magnitude2]
+            massreco_chosen_pair_wrong_pull_angle  = [np.nan, pull_angle2]
+            if original_hj1 < n_jets_good and original_hj2 < n_jets_good:
+                massreco_chosen_pair_correct_jet_pt    = events["JetGood"]["pt"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_pt      = events["JetGood"]["pt"][event_idx][original_hj2]
+                massreco_chosen_pair_correct_jet_eta   = events["JetGood"]["eta"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_eta     = events["JetGood"]["eta"][event_idx][original_hj2]
+                massreco_chosen_pair_correct_jet_phi   = events["JetGood"]["phi"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_phi     = events["JetGood"]["phi"][event_idx][original_hj2]
+                massreco_chosen_pair_correct_jet_btag_score = events["JetGood"][btag_branch][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_btag_score   = events["JetGood"][btag_branch][event_idx][original_hj2]
+
+        # ----- case: second jet matched, first wrong -----
+        elif first_match == 0. and second_match == 1.:
+            massreco_chosen_pair_wrong_higgs_mass_1_jets = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_higgs_mass   = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_all_higgs_mass     = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_top_mass     = events[f"{prefix}_top_mass"][event_idx]
+            massreco_chosen_pair_wrong_W_mass       = events[f"{prefix}_W_mass"][event_idx]
+            massreco_chosen_pair_wrong_ttH_mass     = events[f"{prefix}_ttH_mass"][event_idx]
+            massreco_chosen_pair_wrong_dr           = dr
+            massreco_chosen_pair_wrong_dr_top       = dr_top
+            massreco_chosen_pair_wrong_lep_pos      = dr_min_pos
+            massreco_chosen_pair_wrong_lep_neg      = dr_min_neg
+            massreco_chosen_pair_wrong_pt_assymetry = pt_assymetry
+            massreco_chosen_pair_wrong_delta_angle  = delta_angle
+            massreco_chosen_pair_wrong_delta_magn   = pull_magnitude_diff
+            massreco_chosen_pair_wrong_jet_mult     = events["nJetGood"][event_idx]
+            massreco_chosen_pair_correct_pull_magn  = [pull_magnitude2, np.nan]
+            massreco_chosen_pair_correct_pull_angle = [pull_angle2, np.nan]
+            massreco_chosen_pair_wrong_pull_magn   = [np.nan, pull_magnitude1]
+            massreco_chosen_pair_wrong_pull_angle  = [np.nan, pull_angle1]
+            if original_hj1 < n_jets_good and original_hj2 < n_jets_good:
+                massreco_chosen_pair_correct_jet_pt    = events["JetGood"]["pt"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_pt      = events["JetGood"]["pt"][event_idx][original_hj1]
+                massreco_chosen_pair_correct_jet_eta   = events["JetGood"]["eta"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_eta     = events["JetGood"]["eta"][event_idx][original_hj1]
+                massreco_chosen_pair_correct_jet_phi   = events["JetGood"]["phi"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_phi     = events["JetGood"]["phi"][event_idx][original_hj1]
+                massreco_chosen_pair_correct_jet_btag_score = events["JetGood"][btag_branch][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_btag_score   = events["JetGood"][btag_branch][event_idx][original_hj1]
+
+        # ----- case: neither jet matched (FIX D: separate if block, not elif) -----
+        # Note: this is now a separate if, correctly independent of the above elif chain
+        if first_match == 0. and second_match == 0.:
+            # Mass/event-level quantities: always fill, no JetGood indexing needed
+            massreco_chosen_pair_wrong_higgs_mass      = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_higgs_mass_2_jets = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_all_higgs_mass        = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_wrong_top_mass        = events[f"{prefix}_top_mass"][event_idx]
+            massreco_chosen_pair_wrong_W_mass          = events[f"{prefix}_W_mass"][event_idx]
+            massreco_chosen_pair_wrong_ttH_mass        = events[f"{prefix}_ttH_mass"][event_idx]
+            massreco_chosen_pair_wrong_jet_mult        = events["nJetGood"][event_idx]
+            massreco_chosen_pair_wrong_dr              = dr
+            massreco_chosen_pair_wrong_dr_top          = dr_top
+            massreco_chosen_pair_wrong_lep_pos         = dr_min_pos
+            massreco_chosen_pair_wrong_lep_neg         = dr_min_neg
+            massreco_chosen_pair_wrong_pt_assymetry    = pt_assymetry
+            massreco_chosen_pair_wrong_delta_angle     = delta_angle
+            massreco_chosen_pair_wrong_delta_magn      = pull_magnitude_diff
+            massreco_chosen_pair_wrong_pull_magn       = [pull_magnitude1, pull_magnitude2]
+            massreco_chosen_pair_wrong_pull_angle      = [pull_angle1, pull_angle2]
+            # Jet-level quantities: only fill if reco indices are within JetGood bounds
+            if original_hj1 < n_jets_good and original_hj2 < n_jets_good:
+                massreco_chosen_pair_wrong_jet_pt         = events["JetGood"]["pt"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_pt_second  = events["JetGood"]["pt"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_eta        = events["JetGood"]["eta"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_eta_second = events["JetGood"]["eta"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_phi        = events["JetGood"]["phi"][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_phi_second = events["JetGood"]["phi"][event_idx][original_hj2]
+                massreco_chosen_pair_wrong_jet_btag_score        = events["JetGood"][btag_branch][event_idx][original_hj1]
+                massreco_chosen_pair_wrong_jet_btag_score_second = events["JetGood"][btag_branch][event_idx][original_hj2]
+
+        # ----- case: both jets matched (FIX D: separate if, was unreachable elif) -----
+        if first_match == 1. and second_match == 1.:
+            massreco_chosen_pair_correct_jet_pt           = events["JetGood"]["pt"][event_idx][original_hj1]
+            massreco_chosen_pair_correct_jet_pt_second    = events["JetGood"]["pt"][event_idx][original_hj2]
+            massreco_chosen_pair_correct_jet_eta          = events["JetGood"]["eta"][event_idx][original_hj1]
+            massreco_chosen_pair_correct_jet_eta_second   = events["JetGood"]["eta"][event_idx][original_hj2]
+            massreco_chosen_pair_correct_jet_phi          = events["JetGood"]["phi"][event_idx][original_hj1]
+            massreco_chosen_pair_correct_jet_phi_second   = events["JetGood"]["phi"][event_idx][original_hj2]
+            massreco_chosen_pair_correct_jet_btag_score        = events["JetGood"][btag_branch][event_idx][original_hj1]
+            massreco_chosen_pair_correct_jet_btag_score_second = events["JetGood"][btag_branch][event_idx][original_hj2]
+            massreco_chosen_pair_correct_higgs_mass  = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_all_higgs_mass      = events[f"{prefix}_higgs_mass"][event_idx]
+            massreco_chosen_pair_correct_top_mass    = events[f"{prefix}_top_mass"][event_idx]
+            massreco_chosen_pair_correct_W_mass      = events[f"{prefix}_W_mass"][event_idx]
+            massreco_chosen_pair_correct_ttH_mass    = events[f"{prefix}_ttH_mass"][event_idx]
+            massreco_chosen_pair_correct_dr          = dr
+            massreco_chosen_pair_correct_delta_angle = delta_angle
+            massreco_chosen_pair_correct_delta_magn  = pull_magnitude_diff
+            massreco_chosen_pair_correct_dr_top      = dr_top
+            massreco_chosen_pair_correct_lep_pos     = dr_min_pos
+            massreco_chosen_pair_correct_lep_neg     = dr_min_neg
+            massreco_chosen_pair_correct_pt_assymetry = pt_assymetry
+            massreco_chosen_pair_correct_jet_mult    = events["nJetGood"][event_idx]
+            # FIX E: correct_pull_* filled here (was previously stored in wrong_pull_*)
+            massreco_chosen_pair_correct_pull_magn   = [pull_magnitude1, pull_magnitude2]
+            massreco_chosen_pair_correct_pull_angle  = [pull_angle1, pull_angle2]
+
+        # --- Step 12: append results ---
+        higgs_mass_truth_jets_1.append([higgs_mass_truth_jets])
+        numerators.append([numerator])
+        denominators.append([denominator])
+        correct_matches.append([correct_match])
+        correct_agreements.append([0.])   # agreement logic was unused; kept as placeholder
+        firstandsecondmaxweight_higgs_mass_1.append([])
+        pair_phi.append([])
+        pair_eta.append([])
+        pair_mass.append([])
+        pair_pt.append([])
+        pair_indices.append([])
+        pair_dr.append([])
+
+        massreco_chosen_pair_all_higgs_mass_1.append([massreco_chosen_pair_all_higgs_mass])
+        massreco_chosen_pair_correct_higgs_mass_1.append([massreco_chosen_pair_correct_higgs_mass])
+        massreco_chosen_pair_wrong_higgs_mass_1.append([massreco_chosen_pair_wrong_higgs_mass])
+        massreco_chosen_pair_wrong_higgs_mass_2_jets_1.append([massreco_chosen_pair_wrong_higgs_mass_2_jets])
+        massreco_chosen_pair_wrong_higgs_mass_1_jets_1.append([massreco_chosen_pair_wrong_higgs_mass_1_jets])
+        massreco_chosen_pair_correct_top_mass_1.append([massreco_chosen_pair_correct_top_mass])
+        massreco_chosen_pair_wrong_top_mass_1.append([massreco_chosen_pair_wrong_top_mass])
+        massreco_chosen_pair_correct_W_mass_1.append([massreco_chosen_pair_correct_W_mass])
+        massreco_chosen_pair_wrong_W_mass_1.append([massreco_chosen_pair_wrong_W_mass])
+        massreco_chosen_pair_correct_ttH_mass_1.append([massreco_chosen_pair_correct_ttH_mass])
+        massreco_chosen_pair_wrong_ttH_mass_1.append([massreco_chosen_pair_wrong_ttH_mass])
+        massreco_chosen_pair_correct_jet_pt_1.append([massreco_chosen_pair_correct_jet_pt,
+                                                      massreco_chosen_pair_correct_jet_pt_second])
+        massreco_chosen_pair_wrong_jet_pt_1.append([massreco_chosen_pair_wrong_jet_pt,
+                                                    massreco_chosen_pair_wrong_jet_pt_second])
+        massreco_chosen_pair_correct_jet_eta_1.append([massreco_chosen_pair_correct_jet_eta,
+                                                       massreco_chosen_pair_correct_jet_eta_second])
+        massreco_chosen_pair_wrong_jet_eta_1.append([massreco_chosen_pair_wrong_jet_eta,
+                                                     massreco_chosen_pair_wrong_jet_eta_second])
+        massreco_chosen_pair_correct_jet_phi_1.append([massreco_chosen_pair_correct_jet_phi,
+                                                       massreco_chosen_pair_correct_jet_phi_second])
+        massreco_chosen_pair_wrong_jet_phi_1.append([massreco_chosen_pair_wrong_jet_phi,
+                                                     massreco_chosen_pair_wrong_jet_phi_second])
+        massreco_chosen_pair_correct_jet_btag_score_1.append([massreco_chosen_pair_correct_jet_btag_score,
+                                                               massreco_chosen_pair_correct_jet_btag_score_second])
+        massreco_chosen_pair_wrong_jet_btag_score_1.append([massreco_chosen_pair_wrong_jet_btag_score,
+                                                             massreco_chosen_pair_wrong_jet_btag_score_second])
+        massreco_chosen_pair_correct_jet_mult_1.append([massreco_chosen_pair_correct_jet_mult])
+        massreco_chosen_pair_wrong_jet_mult_1.append([massreco_chosen_pair_wrong_jet_mult])
+        massreco_chosen_pair_correct_dr_1.append([massreco_chosen_pair_correct_dr])
+        massreco_chosen_pair_wrong_dr_1.append([massreco_chosen_pair_wrong_dr])
+        massreco_chosen_pair_correct_delta_angle_1.append([massreco_chosen_pair_correct_delta_angle])
+        massreco_chosen_pair_wrong_delta_angle_1.append([massreco_chosen_pair_wrong_delta_angle])
+        massreco_chosen_pair_correct_delta_magn_1.append([massreco_chosen_pair_correct_delta_magn])
+        massreco_chosen_pair_wrong_delta_magn_1.append([massreco_chosen_pair_wrong_delta_magn])
+        massreco_chosen_pair_correct_pull_angle_1.append([massreco_chosen_pair_correct_pull_angle])
+        massreco_chosen_pair_wrong_pull_angle_1.append([massreco_chosen_pair_wrong_pull_angle])
+        massreco_chosen_pair_correct_pull_magn_1.append([massreco_chosen_pair_correct_pull_magn])
+        massreco_chosen_pair_wrong_pull_magn_1.append([massreco_chosen_pair_wrong_pull_magn])
+        massreco_chosen_pair_correct_dr_top_1.append([massreco_chosen_pair_correct_dr_top])
+        massreco_chosen_pair_wrong_dr_top_1.append([massreco_chosen_pair_wrong_dr_top])
+        massreco_chosen_pair_correct_lep_pos_1.append([massreco_chosen_pair_correct_lep_pos])
+        massreco_chosen_pair_wrong_lep_pos_1.append([massreco_chosen_pair_wrong_lep_pos])
+        massreco_chosen_pair_correct_lep_neg_1.append([massreco_chosen_pair_correct_lep_neg])
+        massreco_chosen_pair_wrong_lep_neg_1.append([massreco_chosen_pair_wrong_lep_neg])
+        massreco_chosen_pair_correct_pt_assymetry_1.append([massreco_chosen_pair_correct_pt_assymetry])
+        massreco_chosen_pair_wrong_pt_assymetry_1.append([massreco_chosen_pair_wrong_pt_assymetry])
+
+    # === Block 1: global sanity counters ===
+    n_total    = t
+    n_skipped  = t - len(correct_matches)
+    n_no_reco  = sum(1 for x in correct_matches if len(x) == 0)
+    n_correct_2 = sum(1 for x in correct_matches if len(x) > 0 and x[0] == 2.)
+    n_correct_1 = sum(1 for x in correct_matches if len(x) > 0 and x[0] == 1.)
+    n_correct_0 = sum(1 for x in correct_matches if len(x) > 0 and x[0] == 0.)
+    n_with_reco = n_correct_2 + n_correct_1 + n_correct_0
+
+    print(f"\n=== compute_jet_pair_properties_all_events ===")
+    print(f"  Total events           : {n_total}")
+    print(f"  Skipped (no truth/btag): {n_skipped}")
+    print(f"  Reco had no solution   : {n_no_reco}")
+    print(f"  correct_match == 2     : {n_correct_2}  (both Higgs jets right)")
+    print(f"  correct_match == 1     : {n_correct_1}  (one Higgs jet right)")
+    print(f"  correct_match == 0     : {n_correct_0}  (neither Higgs jet right)")
+    print(f"  Efficiency (match==2)  : {n_correct_2 / max(1, n_with_reco):.3f}")
+
+    # Cross-check: correct_higgs_mass filled iff match==2, wrong_higgs_mass filled iff match==0
+    n_correct_mass_filled = sum(1 for x in massreco_chosen_pair_correct_higgs_mass_1
+                                if len(x) > 0 and x[0] is not None)
+    n_wrong_mass_filled   = sum(1 for x in massreco_chosen_pair_wrong_higgs_mass_1
+                                if len(x) > 0 and x[0] is not None)
+    n_correct_0_with_reco = sum(
+        1 for i, x in enumerate(correct_matches)
+        if len(x) > 0 and x[0] == 0.
+        and len(massreco_chosen_pair_wrong_higgs_mass_1[i]) > 0
+        and massreco_chosen_pair_wrong_higgs_mass_1[i][0] is not None
+    )
+    n_correct_0_no_reco = n_correct_0 - n_correct_0_with_reco
+
+    print(f"  correct_higgs_mass filled : {n_correct_mass_filled}  (should == n_correct_2={n_correct_2})")
+    print(f"  wrong_higgs_mass filled   : {n_wrong_mass_filled}  "
+          f"(match==0 with reco={n_correct_0_with_reco}, match==0 no reco={n_correct_0_no_reco}, "
+          f"total match==0={n_correct_0})")
+
+    # === Block 4: pull angle label sanity check ===
+    # Expected behaviour per match case:
+    #   correct_match==2 : correct_pull filled (both values), wrong_pull = [nan, nan]
+    #   correct_match==1 : correct_pull filled (one value + nan), wrong_pull has one nan — OK
+    #   correct_match==0 : wrong_pull filled (both values) if reco jets in bounds, else nan is acceptable
+    pull_warn_count = 0
+    for i, (cm, cpm, wpm) in enumerate(zip(
+            correct_matches,
+            massreco_chosen_pair_correct_pull_magn_1,
+            massreco_chosen_pair_wrong_pull_magn_1)):
+        if len(cm) == 0:
+            continue
+
+        def has_any_value(lst):
+            return (len(lst) > 0 and len(lst[0]) >= 1
+                    and not all(np.isnan(float(v)) for v in lst[0] if v is not None))
+
+        def both_values(lst):
+            return (len(lst) > 0 and len(lst[0]) >= 2
+                    and not np.isnan(float(lst[0][0]))
+                    and not np.isnan(float(lst[0][1])))
+
+        # match==2: correct_pull must have both values; wrong_pull must be all nan
+        if cm[0] == 2.:
+            if not both_values(cpm):
+                print(f"  WARNING event {i}: correct_match==2 but correct_pull_magn missing values — "
+                      f"reco Higgs jets likely out of JetGood bounds")
+                pull_warn_count += 1
+            if has_any_value(wpm):
+                print(f"  WARNING event {i}: correct_match==2 but wrong_pull_magn is filled — check Fix E")
+                pull_warn_count += 1
+
+        # match==0: wrong_pull should have values if reco jets were in bounds
+        # nan is acceptable when original_hj1/hj2 >= n_jets_good (5th jet edge case)
+        # so we only warn if wrong_higgs_mass was filled but pull is nan (inconsistency)
+        elif cm[0] == 0.:
+            wm = massreco_chosen_pair_wrong_higgs_mass_1[i]
+            mass_filled = len(wm) > 0 and wm[0] is not None
+            if mass_filled and not has_any_value(wpm):
+                print(f"  WARNING event {i}: correct_match==0, wrong_higgs_mass filled "
+                      f"but wrong_pull_magn is nan — reco jets may be out of JetGood bounds")
+                pull_warn_count += 1
+
+    if pull_warn_count == 0:
+        print(f"  Pull magn label check     : OK (no warnings)")
+    else:
+        print(f"  Pull magn label check     : {pull_warn_count} warnings — inspect above")
+    print(f"==============================================\n")
+
+    props = {
+        "pair_phi": pair_phi,
+        "pair_eta": pair_eta,
+        "pair_mass": pair_mass,
+        "pair_pt": pair_pt,
+        "pair_indices": pair_indices,
+        "pair_dr": pair_dr,
+        "numerators": numerators,
+        "denominators": denominators,
+        "correct_matches": correct_matches,
+        "correct_agreements": correct_agreements,
+        "higgs_mass_truth_jets": higgs_mass_truth_jets_1,
+        "massreco_chosen_pair_all_higgs_mass": massreco_chosen_pair_all_higgs_mass_1,
+        "massreco_chosen_pair_correct_higgs_mass": massreco_chosen_pair_correct_higgs_mass_1,
+        "massreco_chosen_pair_wrong_higgs_mass": massreco_chosen_pair_wrong_higgs_mass_1,
+        "massreco_chosen_pair_wrong_higgs_mass_2_jets": massreco_chosen_pair_wrong_higgs_mass_2_jets_1,
+        "massreco_chosen_pair_wrong_higgs_mass_1_jets": massreco_chosen_pair_wrong_higgs_mass_1_jets_1,
+        "massreco_chosen_pair_correct_top_mass": massreco_chosen_pair_correct_top_mass_1,
+        "massreco_chosen_pair_wrong_top_mass": massreco_chosen_pair_wrong_top_mass_1,
+        "massreco_chosen_pair_correct_W_mass": massreco_chosen_pair_correct_W_mass_1,
+        "massreco_chosen_pair_wrong_W_mass": massreco_chosen_pair_wrong_W_mass_1,
+        "massreco_chosen_pair_correct_ttH_mass": massreco_chosen_pair_correct_ttH_mass_1,
+        "massreco_chosen_pair_wrong_ttH_mass": massreco_chosen_pair_wrong_ttH_mass_1,
+        "massreco_chosen_pair_correct_jet_pt": massreco_chosen_pair_correct_jet_pt_1,
+        "massreco_chosen_pair_wrong_jet_pt": massreco_chosen_pair_wrong_jet_pt_1,
+        "massreco_chosen_pair_correct_jet_eta": massreco_chosen_pair_correct_jet_eta_1,
+        "massreco_chosen_pair_wrong_jet_eta": massreco_chosen_pair_wrong_jet_eta_1,
+        "massreco_chosen_pair_correct_jet_phi": massreco_chosen_pair_correct_jet_phi_1,
+        "massreco_chosen_pair_wrong_jet_phi": massreco_chosen_pair_wrong_jet_phi_1,
+        "massreco_chosen_pair_correct_jet_mult": massreco_chosen_pair_correct_jet_mult_1,
+        "massreco_chosen_pair_wrong_jet_mult": massreco_chosen_pair_wrong_jet_mult_1,
+        "massreco_chosen_pair_correct_dr": massreco_chosen_pair_correct_dr_1,
+        "massreco_chosen_pair_wrong_dr": massreco_chosen_pair_wrong_dr_1,
+        "massreco_chosen_pair_correct_delta_angle": massreco_chosen_pair_correct_delta_angle_1,
+        "massreco_chosen_pair_wrong_delta_angle": massreco_chosen_pair_wrong_delta_angle_1,
+        "massreco_chosen_pair_correct_pull_magn": massreco_chosen_pair_correct_pull_magn_1,
+        "massreco_chosen_pair_wrong_pull_magn": massreco_chosen_pair_wrong_pull_magn_1,
+        "massreco_chosen_pair_correct_pull_angle": massreco_chosen_pair_correct_pull_angle_1,
+        "massreco_chosen_pair_wrong_pull_angle": massreco_chosen_pair_wrong_pull_angle_1,
+        "massreco_chosen_pair_correct_delta_magn": massreco_chosen_pair_correct_delta_magn_1,
+        "massreco_chosen_pair_wrong_delta_magn": massreco_chosen_pair_wrong_delta_magn_1,
+        "massreco_chosen_pair_correct_dr_top": massreco_chosen_pair_correct_dr_top_1,
+        "massreco_chosen_pair_wrong_dr_top": massreco_chosen_pair_wrong_dr_top_1,
+        "massreco_chosen_pair_correct_lep_pos": massreco_chosen_pair_correct_lep_pos_1,
+        "massreco_chosen_pair_wrong_lep_pos": massreco_chosen_pair_wrong_lep_pos_1,
+        "massreco_chosen_pair_correct_lep_neg": massreco_chosen_pair_correct_lep_neg_1,
+        "massreco_chosen_pair_wrong_lep_neg": massreco_chosen_pair_wrong_lep_neg_1,
+        "massreco_chosen_pair_correct_pt_assymetry": massreco_chosen_pair_correct_pt_assymetry_1,
+        "massreco_chosen_pair_wrong_pt_assymetry": massreco_chosen_pair_wrong_pt_assymetry_1,
+        "massreco_chosen_pair_correct_jet_btag_score": massreco_chosen_pair_correct_jet_btag_score_1,
+        "massreco_chosen_pair_wrong_jet_btag_score": massreco_chosen_pair_wrong_jet_btag_score_1,
     }
+    return props
+
+
+def compute_pair_kinematics_simple(jet1, jet2):
+    # Extract properties
+    pt1, eta1, phi1, mass1 = float(jet1.pt), float(jet1.eta), float(jet1.phi), float(jet1.mass)
+    pt2, eta2, phi2, mass2 = float(jet2.pt), float(jet2.eta), float(jet2.phi), float(jet2.mass)
+
+    # ΔR
+    dr = calculate_dr(eta1, phi1, eta2, phi2)
+
+    # Invariant mass (using 4-vector components)
+    px1, py1, pz1 = pt1 * np.cos(phi1), pt1 * np.sin(phi1), pt1 * np.sinh(eta1)
+    px2, py2, pz2 = pt2 * np.cos(phi2), pt2 * np.sin(phi2), pt2 * np.sinh(eta2)
+    e1 = np.sqrt(px1**2 + py1**2 + pz1**2 + mass1**2)
+    e2 = np.sqrt(px2**2 + py2**2 + pz2**2 + mass2**2)
+
+    px, py, pz, e = px1 + px2, py1 + py2, pz1 + pz2, e1 + e2
+    mass = np.sqrt(np.maximum(e**2 - px**2 - py**2 - pz**2, 0.0))
+
+    # Average φ and η (non-periodic average for φ is ok here since jets are close)
+    phi_avg = 0.5 * (phi1 + phi2)
+    eta_avg = 0.5 * (eta1 + eta2)
+
+    return phi_avg, eta_avg, mass, dr
+
+
+def compute_jet_pair_properties_all_events_4(events, j_matched, q_matched, btag_branch="btagUParTAK4B"):
+    """
+    Diagnostic function with three goals:
+
+    Goal 1 — Acceptance study
+        pair_in_the_4leading      : are both truth Higgs jets among the top-4 pt-sorted JetGood jets?
+        pair_in_the_4leadingbtag  : are both truth Higgs jets among the top-4 btag-scored JetGood jets?
+        Codes: 0 = truth pair not found, 1 = found but NOT both in top-4, 2 = both in top-4
+
+    Goal 2 — Mass reco outcome classification
+        mass_reco_had_a_solution:
+            0 = no truth pair AND no reco solution
+            1 = truth pair found, reco had NO solution
+            2 = truth pair found, reco had solution, both truth jets in top-4 btag
+            3 = truth pair found, reco had solution, truth jets NOT in top-4 btag
+            4 = no truth pair, reco had a solution
+            5 = truth pair found, reco had solution, truth jets in top-4 btag, reco got it RIGHT
+            6 = truth pair found, reco had solution, truth jets in top-4 btag, reco got it WRONG
+
+    Goal 3 — Truth-pair kinematics
+        pair_phi_truth, pair_eta_truth, pair_mass_truth, pair_dr_truth, pair_indices_truth
+        Always filled when truth pair exists, regardless of reco outcome.
+        Lets you compare kinematic properties across reco outcome categories.
+    """
+
+    pair_phi_truth      = []
+    pair_eta_truth      = []
+    pair_mass_truth     = []
+    pair_dr_truth       = []
+    pair_indices_truth  = []
+    pair_in_the_4leading         = []
+    pair_in_the_4leadingbtagscore = []
+    mass_reco_had_a_solution     = []
+
+    prefix = "max_weight"
+
+    for event_idx in range(len(events)):
+
+        jets = events["JetGood"][event_idx]
+        n_jets_good = len(events["JetGood"]["pt"][event_idx])
+
+        # --- Step 1: find truth-matched Higgs jet indices ---
+        truth_pair = [
+            idx for idx, parton in enumerate(q_matched[event_idx])
+            if parton is not None and parton.provenance == 1
+        ]
+        has_truth = len(truth_pair) == 2
+        reco_combination = events[f"{prefix}_combination"][event_idx]
+        has_reco = reco_combination is not None
+
+        # --- Goal 3: truth-pair kinematics (always, when truth exists) ---
+        if has_truth:
+            jet0_idx, jet1_idx = truth_pair
+            jet1 = jets[jet0_idx]
+            jet2 = jets[jet1_idx]
+            d_eta, d_phi, mass, dr = compute_pair_kinematics_simple(jet1, jet2)
+            pair_phi_truth.append([d_phi])
+            pair_eta_truth.append([d_eta])
+            pair_mass_truth.append([mass])
+            pair_dr_truth.append([dr])
+            pair_indices_truth.append([truth_pair])
+        else:
+            pair_phi_truth.append([])
+            pair_eta_truth.append([])
+            pair_mass_truth.append([])
+            pair_dr_truth.append([])
+            pair_indices_truth.append([])
+
+        # --- Goal 1: acceptance study (diagnostics only, both orderings) ---
+        # Check 1a: are truth jets among the top-4 pT-sorted JetGood jets?
+        if has_truth:
+            pt_scores = ak.to_numpy(events["JetGood"]["pt"][event_idx])
+            top4_pt_idx = np.argsort(-pt_scores)[:4]
+            in_top4_pt = (truth_pair[0] in top4_pt_idx and truth_pair[1] in top4_pt_idx)
+            pair_in_the_4leading.append([2 if in_top4_pt else 1])
+        else:
+            pair_in_the_4leading.append([0])
+
+        # Check 1b: are truth jets among the top-4 btag-scored JetGood jets?
+        btag_scores = ak.to_numpy(events["JetGood"][btag_branch][event_idx])
+        if len(btag_scores) >= 4:
+            top4_btag_idx = np.argsort(-btag_scores)[:4]
+            if has_truth:
+                in_top4_btag = (truth_pair[0] in top4_btag_idx
+                                and truth_pair[1] in top4_btag_idx)
+                pair_in_the_4leadingbtagscore.append([2 if in_top4_btag else 1])
+            else:
+                pair_in_the_4leadingbtagscore.append([0])
+        else:
+            # fewer than 4 jets: truth jets cannot both be in top-4
+            pair_in_the_4leadingbtagscore.append([0])
+
+        # --- Acceptance gate for Goal 2: were the truth jets among the
+        #     jets the solver actually received? This uses events["1st_jet_idx"
+        #     .."4th_jet_idx"] -- whichever ordering criterion is active in
+        #     workflow_mc.py (pT now, previously btag) -- instead of a
+        #     hardcoded btag re-derivation, so it stays consistent with
+        #     whatever the solver could actually see. (pair_in_the_4leading /
+        #     pair_in_the_4leadingbtagscore above remain independent,
+        #     ordering-specific diagnostics for comparison.)
+        solver_jet_indices = get_solver_jet_indices(events, event_idx)
+        in_solver_candidates = has_truth and (
+            truth_pair[0] in solver_jet_indices and truth_pair[1] in solver_jet_indices
+        )
+
+        # --- Goal 2: mass reco outcome classification ---
+        if not has_truth and not has_reco:
+            mass_reco_had_a_solution.append([0])  # neither
+
+        elif has_truth and not has_reco:
+            mass_reco_had_a_solution.append([1])  # truth found, reco failed
+
+        elif not has_truth and has_reco:
+            mass_reco_had_a_solution.append([4])  # no truth, reco found
+
+        elif has_truth and has_reco:
+            if not in_solver_candidates:
+                # truth jets weren't both given to the solver: it could not have found them
+                mass_reco_had_a_solution.append([3])
+            else:
+                # truth jets were both given to the solver: check if reco got it right
+                hj1 = reco_combination["2"]
+                hj2 = reco_combination["3"]
+                original_hj1 = get_original_jet_idx(events, event_idx, hj1)
+                original_hj2 = get_original_jet_idx(events, event_idx, hj2)
+
+                if original_hj1 is None or original_hj2 is None:
+                    # 5th jet edge case
+                    mass_reco_had_a_solution.append([3])
+                else:
+                    reco_correct = (
+                        (truth_pair[0] == original_hj1 and truth_pair[1] == original_hj2) or
+                        (truth_pair[0] == original_hj2 and truth_pair[1] == original_hj1)
+                    )
+                    if reco_correct:
+                        mass_reco_had_a_solution.append([5])  # reco got it right
+                    else:
+                        mass_reco_had_a_solution.append([6])  # reco got it wrong
+
+        # Note: code [2] from original (truth in top-4, reco found) is now split
+        # into [5] (correct) and [6] (wrong) for finer discrimination.
+        # If you want the old coarse code, merge [5]+[6] → [2] downstream.
+
+    # --- Summary printout ---
+    counts = {}
+    for x in mass_reco_had_a_solution:
+        key = x[0] if len(x) > 0 else "empty"
+        counts[key] = counts.get(key, 0) + 1
+
+    total = len(events)
+    print(f"\n=== compute_jet_pair_properties_all_events_4 ===")
+    print(f"  Total events : {total}")
+    print(f"  Code 0 (no truth, no reco)                       : {counts.get(0,0)}  ({100*counts.get(0,0)/max(1,total):.1f}%)")
+    print(f"  Code 1 (truth found, reco FAILED)                : {counts.get(1,0)}  ({100*counts.get(1,0)/max(1,total):.1f}%)")
+    print(f"  Code 3 (truth found, truth NOT in solver's jets) : {counts.get(3,0)}  ({100*counts.get(3,0)/max(1,total):.1f}%)")
+    print(f"  Code 4 (no truth, reco found)                    : {counts.get(4,0)}  ({100*counts.get(4,0)/max(1,total):.1f}%)")
+    print(f"  Code 5 (truth in solver's jets, reco CORRECT)    : {counts.get(5,0)}  ({100*counts.get(5,0)/max(1,total):.1f}%)")
+    print(f"  Code 6 (truth in solver's jets, reco WRONG)      : {counts.get(6,0)}  ({100*counts.get(6,0)/max(1,total):.1f}%)")
+
+    n_truth_in_top4 = counts.get(1,0) + counts.get(5,0) + counts.get(6,0)
+    n_reco_attempted = counts.get(5,0) + counts.get(6,0)
+    print(f"  --- Acceptance ---")
+    print(f"  Truth jets available to solver : {n_truth_in_top4}/{total}  ({100*n_truth_in_top4/max(1,total):.1f}%)")
+    print(f"  Reco efficiency (of events with truth available to solver and a reco solution) : "
+          f"{counts.get(5,0)}/{max(1,n_reco_attempted)}  "
+          f"({100*counts.get(5,0)/max(1,n_reco_attempted):.1f}%)")
+
+    n_in_top4_pt   = sum(1 for x in pair_in_the_4leading if len(x) > 0 and x[0] == 2)
+    n_in_top4_btag = sum(1 for x in pair_in_the_4leadingbtagscore if len(x) > 0 and x[0] == 2)
+    print(f"  Truth pair in top-4 by pT  : {n_in_top4_pt}/{total}  ({100*n_in_top4_pt/max(1,total):.1f}%)")
+    print(f"  Truth pair in top-4 by btag: {n_in_top4_btag}/{total}  ({100*n_in_top4_btag/max(1,total):.1f}%)")
+    print(f"================================================\n")
+
+    param = {
+        "pair_in_the_4leading":          pair_in_the_4leading,
+        "pair_in_the_4leadingbtagscore": pair_in_the_4leadingbtagscore,
+        "mass_reco_had_a_solution":      mass_reco_had_a_solution,
+        "pair_phi_truth":                pair_phi_truth,
+        "pair_eta_truth":                pair_eta_truth,
+        "pair_mass_truth":               pair_mass_truth,
+        "pair_dr_truth":                 pair_dr_truth,
+        "pair_indices_truth":            pair_indices_truth,
+    }
+    return param
+
+def compute_jet_pair_properties_per_rank(events, j_matched, q_matched):
+    """
+    For each event, runs truth matching for ALL four ranks independently,
+    regardless of which rank was selected by the DR criterion.
+    Outputs per-rank correct_match and Higgs mass for correct/wrong cases.
+
+    This is used to answer:
+    - "When rank N was rejected, would it have been correct?"
+    - "What is the unconditional efficiency of each rank?"
+    """
+
+    RANK_PREFIXES = [
+        "max_weight",
+        "second_max_weight",
+        "third_max_weight",
+        "fourth_max_weight",
+    ]
+    RANK_NAMES = ["rank1", "rank2", "rank3", "rank4"]
+
+    # Initialise output lists per rank
+    correct_match_per_rank   = {r: [] for r in RANK_NAMES}
+    higgs_mass_correct_per_rank = {r: [] for r in RANK_NAMES}
+    higgs_mass_wrong_per_rank   = {r: [] for r in RANK_NAMES}
+
+    t = len(events)
+
+    for event_idx in range(t):
+
+        # --- Step 1: find truth-matched Higgs jet indices ---
+        higgs_matched_indices = [
+            idx for idx, parton in enumerate(q_matched[event_idx])
+            if parton is not None and parton.provenance == 1
+        ]
+        selected_jet_pair = higgs_matched_indices if len(higgs_matched_indices) == 2 else []
+
+        # If no valid truth pair, append None for all ranks
+        if len(selected_jet_pair) != 2:
+            for r in RANK_NAMES:
+                correct_match_per_rank[r].append(None)
+                higgs_mass_correct_per_rank[r].append(None)
+                higgs_mass_wrong_per_rank[r].append(None)
+            continue
+
+        # --- Step 2: require the solver actually had >=4 jet candidates ---
+        solver_jet_indices = get_solver_jet_indices(events, event_idx)
+        if len(solver_jet_indices) < 4:
+            for r in RANK_NAMES:
+                correct_match_per_rank[r].append(None)
+                higgs_mass_correct_per_rank[r].append(None)
+                higgs_mass_wrong_per_rank[r].append(None)
+            continue
+
+        # --- Step 3: require both truth jets are among the jets the solver
+        #     actually received (pT-ordered now, previously btag) ---
+        jet0, jet1 = selected_jet_pair
+        if not (jet0 in solver_jet_indices and jet1 in solver_jet_indices):
+            for r in RANK_NAMES:
+                correct_match_per_rank[r].append(None)
+                higgs_mass_correct_per_rank[r].append(None)
+                higgs_mass_wrong_per_rank[r].append(None)
+            continue
+
+        n_jets_good = len(events["JetGood"]["eta"][event_idx])
+
+        # --- Loop over all four ranks ---
+        for prefix, rank_name in zip(RANK_PREFIXES, RANK_NAMES):
+
+            reco_combination = events[f"{prefix}_combination"][event_idx]
+
+            if reco_combination is None:
+                correct_match_per_rank[rank_name].append(None)
+                higgs_mass_correct_per_rank[rank_name].append(None)
+                higgs_mass_wrong_per_rank[rank_name].append(None)
+                continue
+
+            hj1 = reco_combination["2"]
+            hj2 = reco_combination["3"]
+
+            original_hj1 = get_original_jet_idx(events, event_idx, hj1)
+            original_hj2 = get_original_jet_idx(events, event_idx, hj2)
+
+            if original_hj1 is None or original_hj2 is None:
+                correct_match_per_rank[rank_name].append(None)
+                higgs_mass_correct_per_rank[rank_name].append(None)
+                higgs_mass_wrong_per_rank[rank_name].append(None)
+                continue
+
+            # Determine match
+            first_match  = 1. if jet0 == original_hj1 or jet1 == original_hj1 else 0.
+            second_match = 1. if jet0 == original_hj2 or jet1 == original_hj2 else 0.
+
+            if first_match == 1. and second_match == 1.:
+                correct_match = 2.
+            elif first_match == 1. or second_match == 1.:
+                correct_match = 1.
+            else:
+                correct_match = 0.
+
+            higgs_mass = events[f"{prefix}_higgs_mass"][event_idx]
+
+            correct_match_per_rank[rank_name].append(correct_match)
+            higgs_mass_correct_per_rank[rank_name].append(higgs_mass if correct_match == 2. else None)
+            higgs_mass_wrong_per_rank[rank_name].append(higgs_mass if correct_match < 2. else None)
+
+    # --- Summary ---
+    print(f"\n=== compute_jet_pair_properties_per_rank ===")
+    for rank_name in RANK_NAMES:
+        cm = correct_match_per_rank[rank_name]
+        n2 = sum(1 for x in cm if x == 2.)
+        n1 = sum(1 for x in cm if x == 1.)
+        n0 = sum(1 for x in cm if x == 0.)
+        nt = n2 + n1 + n0
+        print(f"  {rank_name}: correct={n2}/{nt} ({100*n2/max(1,nt):.1f}%), "
+              f"partial={n1}, wrong={n0}")
+    print(f"==============================================\n")
+
+    res = {}
+    for rank_name in RANK_NAMES:
+        res[f"correct_match_{rank_name}"]        = correct_match_per_rank[rank_name]
+        res[f"higgs_mass_{rank_name}_correct"]   = higgs_mass_correct_per_rank[rank_name]
+        res[f"higgs_mass_{rank_name}_wrong"]     = higgs_mass_wrong_per_rank[rank_name]
+    return res
+
+
+def compute_selected_rejected_correct_wrong(events, props, props_per_rank):
+    """
+    Combines rank_used, correct_match_dr, and per-rank correct_match to produce
+    per-rank mass variables split by selected/rejected and correct/wrong.
+ 
+    Outputs (18 variables):
+    For ranks 1-4:
+        higgs_mass_rankN_selected_correct  — selected by DR criterion AND correct_match==2
+        higgs_mass_rankN_selected_wrong    — selected by DR criterion AND correct_match!=2
+        higgs_mass_rankN_rejected_correct  — rejected by DR criterion AND rank would be correct
+        higgs_mass_rankN_rejected_wrong    — rejected by DR criterion AND rank would be wrong
+    For fallback (rank==0):
+        higgs_mass_fallback_selected_correct
+        higgs_mass_fallback_selected_wrong
+    """
+    t = len(events)
+ 
+    rank_used_list    = ak.to_list(events["rank_used"])
+    correct_match_dr  = ak.to_list(ak.firsts(ak.Array(props["correct_matches"])))
+    mass_chosen       = ak.to_list(events["higgs_mass_chosen"])
+ 
+    cm_rank = {
+        1: ak.to_list(ak.Array(props_per_rank["correct_match_rank1"])),
+        2: ak.to_list(ak.Array(props_per_rank["correct_match_rank2"])),
+        3: ak.to_list(ak.Array(props_per_rank["correct_match_rank3"])),
+        4: ak.to_list(ak.Array(props_per_rank["correct_match_rank4"])),
+    }
+    mass_rank = {
+        1: ak.to_list(events["higgs_mass_rank1"]),
+        2: ak.to_list(events["higgs_mass_rank2"]),
+        3: ak.to_list(events["higgs_mass_rank3"]),
+        4: ak.to_list(events["higgs_mass_rank4"]),
+    }
+ 
+    # Initialise output lists
+    sel_correct = {r: [] for r in [0, 1, 2, 3, 4]}
+    sel_wrong   = {r: [] for r in [0, 1, 2, 3, 4]}
+    rej_correct = {r: [] for r in [1, 2, 3, 4]}
+    rej_wrong   = {r: [] for r in [1, 2, 3, 4]}
+ 
+    n_sel_correct = {r: 0 for r in [0,1,2,3,4]}
+    n_sel_wrong   = {r: 0 for r in [0,1,2,3,4]}
+    n_rej_correct = {r: 0 for r in [1,2,3,4]}
+    n_rej_wrong   = {r: 0 for r in [1,2,3,4]}
+ 
+    for i in range(t):
+        ru    = rank_used_list[i]
+        cm_dr = correct_match_dr[i]
+        mc    = mass_chosen[i]
+ 
+        # Selected cases — only the rank that was actually chosen
+        for r in [0, 1, 2, 3, 4]:
+            if ru == r:
+                if cm_dr == 2.:
+                    sel_correct[r].append(mc)
+                    n_sel_correct[r] += 1
+                    sel_wrong[r].append(None)
+                else:
+                    sel_correct[r].append(None)
+                    sel_wrong[r].append(mc)
+                    n_sel_wrong[r] += 1
+            else:
+                sel_correct[r].append(None)
+                sel_wrong[r].append(None)
+ 
+        # Rejected cases — all ranks that were NOT chosen
+        for r in [1, 2, 3, 4]:
+            if ru != r and ru is not None:
+                rank_cm = cm_rank[r][i]
+                mr      = mass_rank[r][i]
+                if rank_cm == 2.:
+                    rej_correct[r].append(mr)
+                    n_rej_correct[r] += 1
+                    rej_wrong[r].append(None)
+                elif rank_cm is not None:
+                    rej_correct[r].append(None)
+                    rej_wrong[r].append(mr)
+                    n_rej_wrong[r] += 1
+                else:
+                    rej_correct[r].append(None)
+                    rej_wrong[r].append(None)
+            else:
+                rej_correct[r].append(None)
+                rej_wrong[r].append(None)
+ 
+    # Summary
+    print(f"\n=== compute_selected_rejected_correct_wrong ===")
+    rank_names = {0: 'fallback', 1: 'rank1', 2: 'rank2', 3: 'rank3', 4: 'rank4'}
+    for r in [1, 2, 3, 4]:
+        print(f"  {rank_names[r]}:")
+        print(f"    selected correct={n_sel_correct[r]}, wrong={n_sel_wrong[r]}")
+        print(f"    rejected correct={n_rej_correct[r]}, wrong={n_rej_wrong[r]}")
+    print(f"  fallback: selected correct={n_sel_correct[0]}, wrong={n_sel_wrong[0]}")
+    print(f"==============================================\n")
+ 
+    res = {}
+    for r in [1, 2, 3, 4]:
+        res[f"higgs_mass_rank{r}_selected_correct"] = sel_correct[r]
+        res[f"higgs_mass_rank{r}_selected_wrong"]   = sel_wrong[r]
+        res[f"higgs_mass_rank{r}_rejected_correct"] = rej_correct[r]
+        res[f"higgs_mass_rank{r}_rejected_wrong"]   = rej_wrong[r]
+    res["higgs_mass_fallback_selected_correct"] = sel_correct[0]
+    res["higgs_mass_fallback_selected_wrong"]   = sel_wrong[0]
+    return res

@@ -46,10 +46,9 @@ from itertools import permutations
 from collections import Counter
 from numba import njit
 from parton import mkPDF
-from custom_function import *
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-PDF_DIR        = "/eos/user/p/piosifid/PocketCoffea/ANN_newCoffea/INF_DNN_new"
+PDF_DIR        = "."
 ECM            = 13600      # centre-of-mass energy [GeV]
 Q_SCALE        = 234        # PDF evaluation scale [GeV]
 MT_MIN         = 150        # top mass scan start [GeV]
@@ -209,9 +208,44 @@ def quartic_solver(polx):
                 j = (e + h_squared - f / h) / 2
                 solutions.extend([root + shift for root in quadratic_solver([j, h, 1])])
                 solutions.extend([root + shift for root in quadratic_solver([g / j, -h, 1])])
+                break  # any one valid h reconstructs all 4 roots of the quartic --
+                       # using more than one just re-derives the same roots with
+                       # extra floating-point noise, producing spurious "5th/6th/
+                       # 7th/8th root" artifacts the dedup tolerance can miss
     return solutions
 
-
+def count_quartic_real_roots(polx):
+    """Like quartic_solver, but returns the REAL root count WITH MULTIPLICITY
+    (always 0, 2, or 4 for a true quartic) instead of the list of distinct
+    values. A double root counts as 2, not 1 -- physically correct, unlike
+    len(quartic_solver(polx)), which dedups a double root's two coincident
+    roots down to a single distinct value (so it can report 1 or 3)."""
+    if abs(polx[4]) < TOL:
+        return len(cubic_solver(polx[:4]))
+    coeffs = [c / polx[4] for c in polx]
+    if abs(coeffs[0]) < TOL:
+        return 1 + len(cubic_solver(coeffs[1:5]))
+    e = coeffs[2] - 3 * coeffs[3]**2 / 8
+    f = coeffs[1] + coeffs[3]**3 / 8 - coeffs[2] * coeffs[3] / 2
+    g = coeffs[0] - 3 * coeffs[3]**4 / 256 + coeffs[3]**2 * coeffs[2] / 16 - coeffs[3] * coeffs[1] / 4
+    if abs(g) < TOL:
+        return 1 + len(cubic_solver([f, e, 0, 1]))
+    elif abs(f) < TOL:
+        count = 0
+        for z in quadratic_solver([g, e, 1]):
+            if z >= 0:
+                count += 2
+        return count
+    else:
+        resolvent = [-f**2, e**2 - 4 * g, 2 * e, 1]
+        for h_squared in cubic_solver(resolvent):
+            if h_squared > 0:
+                h = math.sqrt(h_squared)
+                j = (e + h_squared - f / h) / 2
+                d1 = h**2 - 4 * j
+                d2 = h**2 - 4 * (g / j)
+                return (2 if d1 > -TOL else 0) + (2 if d2 > -TOL else 0)
+        return 0
 def algebraic_pz(b, lp, mWp, mt, mb, mlp, pnux, pnuy):
     """
     Fallback pz solver for LEG A (real, massless neutrino) only, used when
@@ -595,6 +629,14 @@ def solve_ttbar_semileptonic_v5(events, rng_seed=RNG_SEED):
     out["lost_px_reco_per_event"]  = []
     out["lost_py_reco_per_event"]  = []
     out["lost_pz_reco_per_event"]  = []
+    # neutrino momentum: solved (winning candidate) only -- no "true" field
+    # here, unlike the lost jet, since the algorithm never deliberately
+    # hides/knows the neutrino ahead of time. The caller (workflow.py)
+    # pairs this against a separately-obtained GenPart truth neutrino.
+    out["nu_px_reco_per_event"]    = []
+    out["nu_py_reco_per_event"]    = []
+    out["nu_pz_reco_per_event"]    = []
+    out["all_lost_dpx_per_event"] = []
     out["all_lost_dpx_per_event"] = []
     out["all_lost_dpy_per_event"] = []
     out["all_lost_dpz_per_event"] = []
@@ -650,7 +692,19 @@ def solve_ttbar_semileptonic_v5(events, rng_seed=RNG_SEED):
             out["lost_px_reco_per_event"].append(None)
             out["lost_py_reco_per_event"].append(None)
             out["lost_pz_reco_per_event"].append(None)
+            out["nu_px_reco_per_event"].append(None)
+            out["nu_py_reco_per_event"].append(None)
+            out["nu_pz_reco_per_event"].append(None)
             out["role_weight_max_per_event"].append(None)
+            out["all_lost_dpx_per_event"].append([])
+            out["all_lost_dpy_per_event"].append([])
+            out["all_lost_dpz_per_event"].append([])
+            out["all_lost_dpt_per_event"].append([])
+            out["all_combinations_per_event"].append([])
+            out["all_near_true_mass_per_event"].append([])
+            out["all_weight_per_event"].append([])
+            out["all_lost_pt_per_event"].append([])
+            out["all_ttH_pz_per_event"].append([])
 
         # ── Lepton ────────────────────────────────────────────────────────────
         lep    = events["lepton"][event_idx]
@@ -756,11 +810,15 @@ def solve_ttbar_semileptonic_v5(events, rng_seed=RNG_SEED):
                     b1v = _leg_b_scan_dependent(
                         bhad_E, qvis_E, mt, mW, mqvis, mb_had, mlost2, lm_dot_bb, sqr_lm_E
                     )
-                    dp20, dp10, dp00, dp21, dp11, dp22 = _dp_family_with_mass(
-                        bhad_E, bhad_px, bhad_py, bhad_pz,
-                        qvis_E, qvis_px, qvis_py, qvis_pz,
-                        mt, mW, mlost2
-                    )
+                    try:
+                        dp20, dp10, dp00, dp21, dp11, dp22 = _dp_family_with_mass(
+                            bhad_E, bhad_px, bhad_py, bhad_pz,
+                            qvis_E, qvis_px, qvis_py, qvis_pz,
+                            mt, mW, mlost2
+                        )
+                    except ZeroDivisionError:
+                        reason_counts["dp_family_zero_div"] += 1
+                        break
 
                     polx, d0, d11, d21, d22, c0 = _combine_to_quartic(
                         c00, c10, c20, c11, c21, c22,
@@ -867,8 +925,18 @@ def solve_ttbar_semileptonic_v5(events, rng_seed=RNG_SEED):
                             "combination": key,
                             # solved momentum of the "lost" quark -- compared against the
                             # real dropped jet's momentum (pbx/pby/pbz_true) below, since we
+                            # solved momentum of the "lost" quark -- compared against the
+                            # real dropped jet's momentum (pbx/pby/pbz_true) below, since we
                             # actually know the truth here (we deliberately hid it).
                             "pbx": pbx, "pby": pby, "pbz": pbz,
+                            # solved neutrino momentum -- was computed above (needed for
+                            # pnu_E/Wlep_*/mt_lep_reco just a few lines up) but never kept
+                            # on the candidate dict before now, so lost_px/py/pz_reco was
+                            # the only reco momentum ever exposed downstream. No truth
+                            # counterpart here (unlike the lost quark, the neutrino isn't
+                            # a real jet we deliberately hid -- its truth has to come from
+                            # GenPart, which the caller supplies separately).
+                            "pnux": pnux, "pnuy": pnuy, "pnuz": pnuz,
                             "ttH_pz": ttH_pz,
                         }
                         if key not in weights_by_key:
@@ -1051,6 +1119,9 @@ def solve_ttbar_semileptonic_v5(events, rng_seed=RNG_SEED):
         out["lost_px_reco_per_event"].append(best_max["pbx"] if best_max else None)
         out["lost_py_reco_per_event"].append(best_max["pby"] if best_max else None)
         out["lost_pz_reco_per_event"].append(best_max["pbz"] if best_max else None)
+        out["nu_px_reco_per_event"].append(best_max["pnux"] if best_max else None)
+        out["nu_py_reco_per_event"].append(best_max["pnuy"] if best_max else None)
+        out["nu_pz_reco_per_event"].append(best_max["pnuz"] if best_max else None)
         out["role_weight_max_per_event"].append(role_weight_max if role_weight_max else None)
 
     # ── Aggregate no-solution summary ───────────────────────────────────────
